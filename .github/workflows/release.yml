@@ -1,0 +1,132 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+permissions:
+  contents: write
+
+jobs:
+  guard-main:
+    # Releases are cut from main only.
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+      - name: Tag must be on main
+        run: git branch -r --contains HEAD | grep -Eq 'origin/main$'
+
+  build-macos:
+    runs-on: macos-15
+    needs: [guard-main]
+    if: always() && (needs.guard-main.result == 'success' || needs.guard-main.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            arch: x86_64
+          - target: aarch64-apple-darwin
+            arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          arch="${{ matrix.arch }}"
+          artifact="analytics-${version}-macos-${arch}.tar.gz"
+          tar -C target/${{ matrix.target }}/release -czf "${artifact}" analytics
+          shasum -a 256 "${artifact}" > "${artifact}.sha256"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: analytics-macos-${{ matrix.arch }}
+          path: |
+            analytics-*.tar.gz
+            analytics-*.sha256
+
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    needs: [guard-main]
+    if: always() && (needs.guard-main.result == 'success' || needs.guard-main.result == 'skipped')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          arch="${{ matrix.arch }}"
+          artifact="analytics-${version}-linux-${arch}.tar.gz"
+          tar -C target/${{ matrix.target }}/release -czf "${artifact}" analytics
+          sha256sum "${artifact}" > "${artifact}.sha256"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: analytics-linux-${{ matrix.arch }}
+          path: |
+            analytics-*.tar.gz
+            analytics-*.sha256
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: [build-macos, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: artifacts/*
