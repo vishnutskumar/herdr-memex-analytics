@@ -32,25 +32,33 @@ pub fn run(filters: Filters, paths: &PluginPaths, interval: Duration) -> Result<
     }
 }
 
-/// Evaluate tips from the event hook's state, notify the urgent ones (rate
-/// limited by last_notified_ms), and publish the full list for the report pane.
+/// Evaluate tips across every herdr session's state, notify the urgent ones
+/// (rate limited by last_notified_ms), and publish the full list for the
+/// report pane.
 fn refresh_tips(paths: &PluginPaths) {
-    let mut states = agents::load_states(paths);
     let now = report::now_ms();
-    let due = agents::evaluate_tips(&states, now);
+    let mut due: Vec<agents::Tip> = Vec::new();
 
-    for tip in &due {
-        if tip.urgent {
-            notify::show(paths, &tip.message);
-            if let Some(s) = states.get_mut(&tip.pane_id) {
-                s.last_notified_ms = Some(now);
+    // Each herdr session has its own state file; pane ids are session-scoped.
+    for (session, mut states) in agents::load_all_states(paths) {
+        let session_tips = agents::evaluate_tips(&states, now);
+        for tip in &session_tips {
+            if tip.urgent {
+                notify::show(paths, &tip.message);
+                if let Some(s) = states.get_mut(&tip.pane_id) {
+                    s.last_notified_ms = Some(now);
+                }
             }
         }
-    }
-    if !due.is_empty()
-        && let Err(err) = agents::store_states(paths, &states)
-    {
-        eprintln!("analytics watch: state write failed: {err:#}");
+        if !session_tips.is_empty() {
+            for mut tip in session_tips {
+                tip.message = format!("[{session}] {}", tip.message);
+                due.push(tip);
+            }
+            if let Err(err) = agents::store_states(paths, &session, &states) {
+                eprintln!("analytics watch: state write failed: {err:#}");
+            }
+        }
     }
 
     let published = tips::Tips {

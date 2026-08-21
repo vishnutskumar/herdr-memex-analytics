@@ -45,19 +45,60 @@ pub struct TransitionResult {
     pub completed_turn_ms: Option<u64>,
 }
 
-pub fn states_path(paths: &PluginPaths) -> std::path::PathBuf {
-    paths.state_dir.join("agent-states.json")
+/// Session identity: each herdr session has its own socket, so the socket path
+/// namespaces state. Pane ids are only unique within a session; without this,
+/// two sessions running `w1:p2` would clobber each other's status.
+pub fn session_key() -> String {
+    let raw = std::env::var("HERDR_SOCKET_PATH").unwrap_or_default();
+    let sanitized: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let trimmed = sanitized.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed
+    }
 }
 
-pub fn load_states(paths: &PluginPaths) -> AgentStates {
-    fs::read(states_path(paths))
+pub fn states_path(paths: &PluginPaths, key: &str) -> std::path::PathBuf {
+    paths.state_dir.join(format!("agent-states-{key}.json"))
+}
+
+pub fn load_states(paths: &PluginPaths, key: &str) -> AgentStates {
+    fs::read(states_path(paths, key))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
 }
 
-pub fn store_states(paths: &PluginPaths, states: &AgentStates) -> Result<()> {
-    crate::config::store_json(states_path(paths), states)
+pub fn store_states(paths: &PluginPaths, key: &str, states: &AgentStates) -> Result<()> {
+    crate::config::store_json(states_path(paths, key), states)
+}
+
+/// Every session's states found on disk, for the daemon's cross-session view.
+pub fn load_all_states(paths: &PluginPaths) -> Vec<(String, AgentStates)> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(&paths.state_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(key) = name
+            .strip_prefix("agent-states-")
+            .and_then(|n| n.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if let Ok(bytes) = fs::read(entry.path())
+            && let Ok(states) = serde_json::from_slice::<AgentStates>(&bytes)
+        {
+            out.push((key.to_string(), states));
+        }
+    }
+    out
 }
 
 /// Record a status transition and report what should happen. A working segment
@@ -238,11 +279,94 @@ mod tests {
         };
         let mut states = AgentStates::default();
         apply_transition(&mut states, &tr("w2:p9", "working", 42));
-        store_states(&paths, &states).expect("store");
-        let loaded = load_states(&paths);
+        store_states(&paths, "default", &states).expect("store");
+        let loaded = load_states(&paths, "default");
         let s = loaded.get("w2:p9").expect("state persisted");
         assert_eq!(s.status, "working");
         assert_eq!(s.since_ms, 42);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn same_pane_id_in_two_sessions_stays_isolated() {
+        let dir = std::env::temp_dir().join(format!("analytics-test-multi-{}", std::process::id()));
+        let paths = PluginPaths {
+            state_dir: dir.clone(),
+        };
+        // Both sessions run a pane literally named w1:p1.
+        let mut session_a = AgentStates::default();
+        apply_transition(&mut session_a, &tr("w1:p1", "working", 100));
+        store_states(&paths, "session-a", &session_a).expect("store a");
+
+        let mut session_b = AgentStates::default();
+        apply_transition(&mut session_b, &tr("w1:p1", "blocked", 200));
+        store_states(&paths, "session-b", &session_b).expect("store b");
+
+        let a = load_states(&paths, "session-a");
+        let b = load_states(&paths, "session-b");
+        assert_eq!(a.get("w1:p1").expect("a kept its pane").status, "working");
+        assert_eq!(b.get("w1:p1").expect("b kept its pane").status, "blocked");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn blocked_tip_fires_exactly_at_threshold_but_not_one_ms_before() {
+        let mut states = AgentStates::default();
+        apply_transition(&mut states, &tr("w1:p1", "blocked", 0));
+        let threshold = BLOCKED_TIP_SECS * 1000;
+        assert!(evaluate_tips(&states, threshold - 1).is_empty());
+        assert_eq!(evaluate_tips(&states, threshold).len(), 1);
+    }
+
+    #[test]
+    fn blocked_nag_fires_exactly_at_interval_but_not_one_ms_before() {
+        let mut states = AgentStates::default();
+        apply_transition(&mut states, &tr("w1:p1", "blocked", 0));
+        let notified = 5 * 60 * 1000;
+        states.get_mut("w1:p1").unwrap().last_notified_ms = Some(notified);
+        let interval = BLOCKED_NAG_SECS * 1000;
+        assert!(evaluate_tips(&states, notified + interval - 1).is_empty());
+        assert_eq!(evaluate_tips(&states, notified + interval).len(), 1);
+    }
+
+    #[test]
+    fn long_turn_tip_fires_exactly_at_threshold_and_stays_non_urgent() {
+        let mut states = AgentStates::default();
+        apply_transition(&mut states, &tr("w1:p1", "working", 0));
+        let threshold = LONG_TURN_SECS * 1000;
+        assert!(evaluate_tips(&states, threshold - 1).is_empty());
+        let tips = evaluate_tips(&states, threshold);
+        assert_eq!(tips.len(), 1);
+        assert!(!tips[0].urgent);
+    }
+
+    #[test]
+    fn unknown_start_status_is_recorded_without_side_effects() {
+        let mut states = AgentStates::default();
+        let r = apply_transition(&mut states, &tr("w1:p1", "mystery", 500));
+        assert!(!r.entered_blocked);
+        assert_eq!(r.completed_turn_ms, None);
+        assert_eq!(states["w1:p1"].status, "mystery");
+    }
+
+    #[test]
+    fn human_dur_formats_minutes_hours_and_zero() {
+        assert_eq!(human_dur(0), "0m");
+        assert_eq!(human_dur(59_999), "0m");
+        assert_eq!(human_dur(60_000), "1m");
+        assert_eq!(human_dur(45 * 60_000), "45m");
+        assert_eq!(human_dur(60 * 60_000), "1h0m");
+        assert_eq!(human_dur(90 * 60_000), "1h30m");
+    }
+
+    #[test]
+    fn states_path_names_files_by_session_key() {
+        let paths = PluginPaths {
+            state_dir: std::path::PathBuf::from("/tmp/nowhere"),
+        };
+        assert_eq!(
+            states_path(&paths, "sock-abc"),
+            std::path::PathBuf::from("/tmp/nowhere/agent-states-sock-abc.json")
+        );
     }
 }

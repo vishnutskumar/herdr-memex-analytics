@@ -156,3 +156,194 @@ pub(crate) fn human_tokens(n: u64) -> String {
         _ => format!("{:.1}B", n as f64 / 1_000_000_000.0),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PluginPaths;
+    use crate::report::{ProjectStats, SourceDigest, UsageDigest};
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn tmp_paths(label: &str) -> PluginPaths {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "analytics-render-{label}-{}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+            nanos
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        PluginPaths { state_dir: dir }
+    }
+
+    /// A report with two projects and no usage digest, written as the daemon
+    /// snapshot so `render` never has to scan a memex root.
+    fn seed_snapshot(paths: &PluginPaths, mut rep: Report) -> Report {
+        rep.generated_at_ms = report::now_ms();
+        config::write_snapshot(paths, &rep).unwrap();
+        rep
+    }
+
+    fn sample_report() -> Report {
+        Report {
+            generated_at_ms: 0,
+            since_ms: None,
+            projects: vec![
+                ProjectStats {
+                    project: "alpha".into(),
+                    sessions: 3,
+                    messages: 42,
+                    active_ms: 7_200_000,
+                    last_at_ms: report::now_ms() - 60_000,
+                    sources: BTreeMap::from([("Claude".into(), 2), ("Codex".into(), 1)]),
+                },
+                ProjectStats {
+                    project: "beta".into(),
+                    sessions: 1,
+                    messages: 5,
+                    active_ms: 300_000,
+                    last_at_ms: report::now_ms() - 3_600_000,
+                    sources: BTreeMap::from([("Omp".into(), 1)]),
+                },
+            ],
+            usage: None,
+            usage_note: Some("disabled; set token_usage = true in config.toml".into()),
+        }
+    }
+
+    /// Filters whose root points nowhere: a fresh snapshot must make the scan
+    /// unreachable, proving hermeticity of these tests.
+    fn nowhere_filters() -> Filters {
+        Filters {
+            root: Some(std::path::PathBuf::from("/nonexistent-analytics-test-root")),
+            since_ms: None,
+            project: None,
+        }
+    }
+
+    #[test]
+    fn json_mode_emits_the_seeded_report_verbatim() {
+        let paths = tmp_paths("json");
+        let seeded = seed_snapshot(&paths, sample_report());
+        let out = render(&nowhere_filters(), &paths, true).unwrap();
+        let parsed: Report = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(parsed.projects.len(), 2);
+        assert_eq!(parsed.projects[0].project, seeded.projects[0].project);
+        assert_eq!(parsed.projects[0].messages, 42);
+        assert!(parsed.usage.is_none());
+        fs::remove_dir_all(&paths.state_dir).ok();
+    }
+
+    #[test]
+    fn text_mode_renders_project_rows_with_sources() {
+        let paths = tmp_paths("text");
+        seed_snapshot(&paths, sample_report());
+        let out = render(&nowhere_filters(), &paths, false).unwrap();
+        assert!(
+            out.contains("herdr analytics — all history"),
+            "header: {out}"
+        );
+        assert!(out.contains("alpha"), "project row: {out}");
+        assert!(out.contains("beta"));
+        assert!(out.contains("Claude:2 Codex:1"), "sources map: {out}");
+        assert!(out.contains("Omp:1"));
+        // 7.2M ms active = exactly 2.0 hours.
+        assert!(out.contains("2.0"), "hours column: {out}");
+        fs::remove_dir_all(&paths.state_dir).ok();
+    }
+
+    #[test]
+    fn empty_project_list_shows_the_no_sessions_hint() {
+        let paths = tmp_paths("empty");
+        let mut rep = sample_report();
+        rep.projects.clear();
+        seed_snapshot(&paths, rep);
+        let out = render(&nowhere_filters(), &paths, false).unwrap();
+        assert!(out.contains("(no indexed sessions in window"), "{out}");
+        fs::remove_dir_all(&paths.state_dir).ok();
+    }
+
+    #[test]
+    fn missing_usage_renders_the_unavailable_note() {
+        let paths = tmp_paths("note");
+        seed_snapshot(&paths, sample_report());
+        let out = render(&nowhere_filters(), &paths, false).unwrap();
+        assert!(
+            out.contains("Token usage: unavailable — disabled; set token_usage"),
+            "{out}"
+        );
+        fs::remove_dir_all(&paths.state_dir).ok();
+    }
+
+    #[test]
+    fn present_usage_renders_the_token_usage_block() {
+        let paths = tmp_paths("usage");
+        let mut rep = sample_report();
+        rep.usage_note = None;
+        rep.usage = Some(UsageDigest {
+            events: 10,
+            total_tokens: 25_000,
+            known_cost_usd: 1.5,
+            missed_tokens: 4_000,
+            missed_cost_usd: 0.25,
+            miss_count: 3,
+            idle_misses: 2,
+            model_switch_misses: 1,
+            by_source: vec![SourceDigest {
+                source: "claude".into(),
+                events: 10,
+                total_tokens: 25_000,
+                known_cost_usd: 1.5,
+                missed_tokens: 4_000,
+            }],
+        });
+        seed_snapshot(&paths, rep);
+        let out = render(&nowhere_filters(), &paths, false).unwrap();
+        assert!(out.contains("Token usage"), "{out}");
+        assert!(out.contains("25.0K tokens"), "{out}");
+        assert!(out.contains("$1.50 known cost"), "{out}");
+        assert!(
+            out.contains("idle-gap misses 2, model-switch misses 1"),
+            "{out}"
+        );
+        fs::remove_dir_all(&paths.state_dir).ok();
+    }
+
+    #[test]
+    fn stale_or_missing_snapshot_falls_back_to_a_failed_scan_report() {
+        // No snapshot at all and an unscannable root: load_report_shared (the
+        // daemon's path) must degrade to an empty report, not panic.
+        let paths = tmp_paths("fallback");
+        let rep = load_report_shared(&nowhere_filters(), &paths);
+        assert!(rep.projects.is_empty());
+        assert!(rep.usage_note.unwrap().contains("scan failed"));
+        fs::remove_dir_all(&paths.state_dir).ok();
+    }
+
+    #[test]
+    fn rel_time_buckets_seconds_minutes_hours_days() {
+        let now = 10_000_000_000u64;
+        assert_eq!(rel_time(now, now), "0s");
+        assert_eq!(rel_time(now - 59_000, now), "59s");
+        assert_eq!(rel_time(now - 60_000, now), "1m");
+        assert_eq!(rel_time(now - 3_600_000, now), "1h");
+        assert_eq!(rel_time(now - 86_400_000, now), "1d");
+    }
+
+    #[test]
+    fn human_tokens_scales_through_k_m_b() {
+        assert_eq!(human_tokens(0), "0");
+        assert_eq!(human_tokens(999), "999");
+        assert_eq!(human_tokens(25_000), "25.0K");
+        assert_eq!(human_tokens(1_500_000), "1.5M");
+        assert_eq!(human_tokens(2_000_000_000), "2.0B");
+    }
+}

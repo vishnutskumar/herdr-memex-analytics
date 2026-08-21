@@ -183,9 +183,10 @@ fn event_hook(paths: &PluginPaths, raw: &str) -> Result<()> {
         at_ms: report::now_ms(),
     };
 
-    let mut states = agents::load_states(paths);
+    let session = agents::session_key();
+    let mut states = agents::load_states(paths, &session);
     let result = agents::apply_transition(&mut states, &transition);
-    agents::store_states(paths, &states)?;
+    agents::store_states(paths, &session, &states)?;
 
     if result.entered_blocked {
         let who = transition.agent.as_deref().unwrap_or("agent");
