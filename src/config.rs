@@ -86,3 +86,106 @@ pub fn read_snapshot(paths: &PluginPaths) -> Option<Report> {
     let bytes = fs::read(snapshot_path(paths)).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::report::ProjectStats;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn tmp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "analytics-config-{label}-{}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+            nanos
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sample_report() -> Report {
+        Report {
+            generated_at_ms: 1_234_567,
+            since_ms: None,
+            projects: vec![ProjectStats {
+                project: "demo".into(),
+                sessions: 3,
+                messages: 30,
+                active_ms: 600_000,
+                last_at_ms: 1_000_000,
+                sources: BTreeMap::from([("Claude".into(), 3)]),
+            }],
+            usage: None,
+            usage_note: Some("disabled".into()),
+        }
+    }
+
+    #[test]
+    fn missing_config_file_falls_back_to_defaults() {
+        let paths = PluginPaths {
+            state_dir: tmp_dir("missing").join("does-not-exist"),
+        };
+        assert_eq!(Config::load(&paths).scan_interval_secs, 900);
+    }
+
+    #[test]
+    fn broken_config_toml_falls_back_to_defaults() {
+        let dir = tmp_dir("broken");
+        fs::write(dir.join("config.toml"), "not [valid toml ===").unwrap();
+        let paths = PluginPaths { state_dir: dir };
+        assert_eq!(Config::load(&paths).scan_interval_secs, 900);
+    }
+
+    #[test]
+    fn valid_config_override_is_honored() {
+        let dir = tmp_dir("valid");
+        fs::write(dir.join("config.toml"), "scan_interval_secs = 42\n").unwrap();
+        let paths = PluginPaths { state_dir: dir };
+        assert_eq!(Config::load(&paths).scan_interval_secs, 42);
+    }
+
+    #[test]
+    fn snapshot_round_trips_through_store_and_read() {
+        let dir = tmp_dir("roundtrip");
+        let paths = PluginPaths { state_dir: dir };
+        let rep = sample_report();
+        write_snapshot(&paths, &rep).unwrap();
+        let loaded = read_snapshot(&paths).expect("snapshot readable");
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects[0].project, "demo");
+        assert_eq!(loaded.projects[0].messages, 30);
+    }
+
+    #[test]
+    fn missing_snapshot_reads_as_none() {
+        let paths = PluginPaths {
+            state_dir: tmp_dir("nosnap").join("absent"),
+        };
+        assert!(read_snapshot(&paths).is_none());
+    }
+
+    #[test]
+    fn corrupt_snapshot_reads_as_none_without_panicking() {
+        let dir = tmp_dir("corrupt");
+        fs::write(dir.join("snapshot.json"), b"\xff\xfe not json {{{").unwrap();
+        let paths = PluginPaths { state_dir: dir };
+        assert!(read_snapshot(&paths).is_none());
+    }
+
+    #[test]
+    fn state_dir_env_override_wins_over_home_fallback() {
+        // PluginPaths::new with an explicit override must use it verbatim.
+        let dir = tmp_dir("explicit");
+        let paths = PluginPaths::new(Some(dir.clone())).unwrap();
+        assert_eq!(paths.state_dir, dir);
+    }
+}
