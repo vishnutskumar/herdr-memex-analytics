@@ -24,11 +24,11 @@ jobs:
         run: |
           files=$(git diff --name-only HEAD~1 2>/dev/null || git ls-files)
           skip=scripts/check-personal.sh
+          skip2=.github/workflows/ci.yml
           found=0
           patterns=('/Users/' '/home/[a-z0-9_-]+' '@[A-Za-z0-9.-]+\.local\b' 'Vishnus-MacBook')
           for f in $files; do
-            [ "$f" = "$skip" ] && continue
-            [ -f "$f" ] || continue
+            { [ "$f" = "$skip" ] || [ "$f" = "$skip2" ]; } && continue
             for pat in "${patterns[@]}"; do
               if grep -inE "$pat" "$f" >/dev/null; then
                 echo "personal detail in $f ($pat)" >&2
