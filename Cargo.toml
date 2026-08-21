@@ -1,0 +1,22 @@
+[package]
+name = "herdr-memex-analytics"
+version = "0.1.0"
+edition = "2024"
+description = "Herdr plugin: session efficiency analytics and realtime guidance backed by memex"
+license = "MIT"
+
+[[bin]]
+name = "analytics"
+path = "src/main.rs"
+
+[dependencies]
+memex = { git = "https://github.com/vishnutskumar/memex" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+ort = "=2.0.0-rc.10"
+toml = "0.9"
+ratatui = "0.29"
+crossterm = "0.28"
