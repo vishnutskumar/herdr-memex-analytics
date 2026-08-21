@@ -473,7 +473,7 @@ checksum = "af491d569909a7e4dee0ad7db7f5341fef5c614d5b8ec8cf765732aba3cff681"
 dependencies = [
  "serde",
  "termcolor",
- "unicode-width 0.2.0",
+ "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -2238,7 +2238,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "memex"
 version = "0.11.6"
-source = "git+https://github.com/vishnutskumar/memex#9176bb0e2c88e5013346526c0a9750d87ee7641c"
+source = "git+https://github.com/nicosuave/memex#9176bb0e2c88e5013346526c0a9750d87ee7641c"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

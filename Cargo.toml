@@ -10,7 +10,7 @@ name = "analytics"
 path = "src/main.rs"
 
 [dependencies]
-memex = { git = "https://github.com/vishnutskumar/memex" }
+memex = { git = "https://github.com/nicosuave/memex" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
