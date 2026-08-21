@@ -1,8 +1,14 @@
 # herdr-memex-analytics
 
+![analytics dashboard](docs/tui-demo.gif)
+
 A [Herdr](https://herdr.dev) plugin that turns [memex](https://github.com/nicosuave/memex)
 history into efficiency analytics and realtime guidance for the agents running in
 your panes.
+
+On one real machine, the last 30 days alone surfaced: **$114 of prompt-cache
+waste**, **2,412 cache misses** (101 after idle gaps), and **244 hours** of agent
+time across projects — numbers nobody had looked at before.
 
 ## What it does
 
@@ -34,7 +40,10 @@ Requirements:
 - [memex](https://github.com/nicosuave/memex) installed and indexed (`memex index`)
 - For the token/cost/cache-waste section: `token_usage = true` in `~/.memex/config.toml`
   (the first usage scan parses your log corpora and can take a while; memex caches it)
-- Rust toolchain (the plugin builds itself from source during install)
+
+Installs prefer a prebuilt release binary for your platform (macOS arm64/x86_64,
+Linux x86_64/arm64); building from source is only the fallback when no release
+matches, and then a Rust toolchain is needed.
 
 ## Use
 
@@ -42,9 +51,25 @@ Requirements:
 |---|---|
 | `analytics: toggle report pane` action | Open/close the auto-refreshing report beside your work |
 | `analytics: efficiency report` action | Open the report pane |
-| `report` pane | Live report + current tips, re-rendered every 30 s |
+| `report` pane | Live report + current tips, re-rendered every 30 s (`q` quit, `j/k` move, `r` rescan) |
 | `[[startup]]` hook | Starts the snapshot daemon in the background |
 | `pane.agent_status_changed` hook | Records transitions, notifies on blocked agents |
+
+### Keybinding
+
+Toggle the report pane from anywhere (like memex's `prefix+M`) by adding this to
+`~/.config/herdr/config.toml`, then running `herdr server reload-config`:
+
+```toml
+[[keys.command]]
+key = "prefix+a"
+type = "plugin_action"
+command = "vishnutskumar.memex-analytics.toggle"
+description = "toggle analytics report pane"
+```
+
+(The `vishnutskumar.` prefix is Herdr's plugin-action namespacing, not part of
+the action id.)
 
 The binary is also usable standalone:
 
@@ -64,6 +89,20 @@ State lives under `$HERDR_PLUGIN_STATE_DIR` inside Herdr
 scan_interval_secs = 900   # daemon rescan cadence
 ```
 
+## Agent skill
+
+A skill ships alongside the plugin so coding agents can answer efficiency
+questions ("what did I spend this week?", "why is my bill high?", "how long are
+my agent turns?") directly. Symlink it into your skills directory from the
+plugin root:
+
+```bash
+ln -s "$PLUGIN_ROOT/skills/analytics-report" ~/.claude/skills/analytics-report
+```
+
+The skill teaches agents to use the `analytics` binary's JSON output and the
+turn log; see [skills/analytics-report/SKILL.md](skills/analytics-report/SKILL.md).
+
 ## How it works
 
 ```
@@ -78,14 +117,14 @@ memex (~/.memex)                    herdr
 ```
 
 memex's own code lives upstream; this repo only depends on it as a library and
-reads its index. Bugs in memex belong in the
-[memex fork](https://github.com/nicosuave/memex), not here.
+reads its index. Bugs in memex belong in [nicosuave/memex](https://github.com/nicosuave/memex),
+not here.
 
 ## Development
 
 ```bash
 cargo build --release
-bash herdr/install.sh        # copies target/release/analytics into bin/
+bash herdr/install.sh        # installs target/release/analytics into bin/
 herdr plugin link "$PWD"     # local dev; skips the build step
 ```
 
