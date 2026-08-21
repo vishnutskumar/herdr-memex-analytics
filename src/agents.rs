@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::config::PluginPaths;
@@ -57,13 +57,7 @@ pub fn load_states(paths: &PluginPaths) -> AgentStates {
 }
 
 pub fn store_states(paths: &PluginPaths, states: &AgentStates) -> Result<()> {
-    fs::create_dir_all(&paths.state_dir)
-        .with_context(|| format!("creating {}", paths.state_dir.display()))?;
-    let tmp = states_path(paths).with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec(states)?)
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, states_path(paths))?;
-    Ok(())
+    crate::config::store_json(states_path(paths), states)
 }
 
 /// Record a status transition and report what should happen. A working segment
@@ -108,17 +102,15 @@ pub fn evaluate_tips(states: &AgentStates, now_ms: u64) -> Vec<Tip> {
     for s in states.values() {
         let held_ms = now_ms.saturating_sub(s.since_ms);
         let agent_label = s.agent.clone().unwrap_or_else(|| "agent".to_string());
-        if s.status == "blocked" {
-            if held_ms >= BLOCKED_TIP_SECS * 1000 && due_for_nag(s, now_ms) {
-                tips.push(Tip {
-                    pane_id: s.pane_id.clone(),
-                    message: format!(
-                        "{agent_label} has been blocked {} — it needs input",
-                        human_dur(held_ms)
-                    ),
-                    urgent: true,
-                });
-            }
+        if s.status == "blocked" && held_ms >= BLOCKED_TIP_SECS * 1000 && due_for_nag(s, now_ms) {
+            tips.push(Tip {
+                pane_id: s.pane_id.clone(),
+                message: format!(
+                    "{agent_label} has been blocked {} — it needs input",
+                    human_dur(held_ms)
+                ),
+                urgent: true,
+            });
         } else if s.status == "working" && held_ms >= LONG_TURN_SECS * 1000 {
             tips.push(Tip {
                 pane_id: s.pane_id.clone(),

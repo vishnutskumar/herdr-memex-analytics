@@ -16,6 +16,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
 };
 
+use crate::render::{human_tokens, rel_time};
 use crate::report::{self, Filters, Report};
 use crate::tips;
 
@@ -116,7 +117,10 @@ fn draw_header(f: &mut Frame, area: Rect, rep: &Report) {
             " herdr analytics",
             Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!("  {window} · updated {}", rel(rep.generated_at_ms))),
+        Span::raw(format!(
+            "  {window} · updated {}",
+            rel_time(rep.generated_at_ms, report::now_ms())
+        )),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -162,7 +166,7 @@ fn draw_body(f: &mut Frame, area: Rect, rep: &Report, selected: usize) {
                 Cell::from(p.sessions.to_string()),
                 Cell::from(p.messages.to_string()),
                 Cell::from(format!("{:.1}", p.active_ms as f64 / 3_600_000.0)),
-                Cell::from(rel(p.last_at_ms)),
+                Cell::from(rel_time(p.last_at_ms, report::now_ms())),
             ])
             .style(style)
         })
@@ -193,7 +197,7 @@ fn draw_usage(f: &mut Frame, area: Rect, rep: &Report) {
     match &rep.usage {
         Some(u) => {
             lines.push(kv("events", &thousands(u.events)));
-            lines.push(kv("tokens", &human(u.total_tokens)));
+            lines.push(kv("tokens", &human_tokens(u.total_tokens)));
             lines.push(kv_colored(
                 "cost",
                 &format!("${:.2}", u.known_cost_usd),
@@ -204,7 +208,11 @@ fn draw_usage(f: &mut Frame, area: Rect, rep: &Report) {
                 "cache waste",
                 Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
             )));
-            lines.push(kv_colored("  tokens", &human(u.missed_tokens), Color::Red));
+            lines.push(kv_colored(
+                "  tokens",
+                &human_tokens(u.missed_tokens),
+                Color::Red,
+            ));
             lines.push(kv_colored(
                 "  wasted cost",
                 &format!("${:.2}", u.missed_cost_usd),
@@ -219,7 +227,7 @@ fn draw_usage(f: &mut Frame, area: Rect, rep: &Report) {
                     Span::styled(format!("{:<8}", s.source), accent()),
                     Span::raw(format!(
                         "{:>8}  ${:.2}",
-                        human(s.total_tokens),
+                        human_tokens(s.total_tokens),
                         s.known_cost_usd
                     )),
                 ]));
@@ -230,22 +238,13 @@ fn draw_usage(f: &mut Frame, area: Rect, rep: &Report) {
                 "the cache went cold. Batch related work",
                 "into one session to keep it warm.",
             ] {
-                lines.push(Line::from(Span::styled(
-                    hint,
-                    Style::new().fg(Color::DarkGray),
-                )));
+                lines.push(dim(hint));
             }
         }
         None => {
-            lines.push(Line::from(Span::styled(
-                "token usage unavailable",
-                Style::new().fg(Color::DarkGray),
-            )));
+            lines.push(dim("token usage unavailable"));
             if let Some(note) = &rep.usage_note {
-                lines.push(Line::from(Span::styled(
-                    note.clone(),
-                    Style::new().fg(Color::DarkGray),
-                )));
+                lines.push(dim(note));
             }
         }
     }
@@ -275,18 +274,26 @@ fn accent() -> Style {
     Style::new().fg(Color::Cyan)
 }
 
-fn kv(k: &str, v: &str) -> Line<'static> {
+fn kv_line(k: &str, v: Span<'static>) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{k:<14}"), Style::new().fg(Color::DarkGray)),
-        Span::raw(v.to_string()),
+        v,
     ])
 }
 
+fn kv(k: &str, v: &str) -> Line<'static> {
+    kv_line(k, Span::raw(v.to_string()))
+}
+
 fn kv_colored(k: &str, v: &str, color: Color) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{k:<14}"), Style::new().fg(Color::DarkGray)),
-        Span::styled(v.to_string(), Style::new().fg(color)),
-    ])
+    kv_line(k, Span::styled(v.to_string(), Style::new().fg(color)))
+}
+
+fn dim(s: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        s.to_string(),
+        Style::new().fg(Color::DarkGray),
+    ))
 }
 
 fn thousands(n: u64) -> String {
@@ -299,23 +306,4 @@ fn thousands(n: u64) -> String {
         out.push(c);
     }
     out
-}
-
-fn human(n: u64) -> String {
-    match n {
-        0..=999 => n.to_string(),
-        1_000..=999_999 => format!("{:.1}K", n as f64 / 1_000.0),
-        1_000_000..=999_999_999 => format!("{:.1}M", n as f64 / 1_000_000.0),
-        _ => format!("{:.1}B", n as f64 / 1_000_000_000.0),
-    }
-}
-
-fn rel(then_ms: u64) -> String {
-    let secs = report::now_ms().saturating_sub(then_ms) / 1000;
-    match secs {
-        0..=59 => format!("{secs}s"),
-        60..=3599 => format!("{}m", secs / 60),
-        3600..=86_399 => format!("{}h", secs / 3600),
-        _ => format!("{}d", secs / 86_400),
-    }
 }

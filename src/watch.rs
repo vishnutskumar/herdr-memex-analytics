@@ -4,6 +4,7 @@ use anyhow::Result;
 
 use crate::agents;
 use crate::config::{self, PluginPaths};
+use crate::notify;
 use crate::report::{self, Filters};
 use crate::tips;
 
@@ -40,7 +41,7 @@ fn refresh_tips(paths: &PluginPaths) {
 
     for tip in &due {
         if tip.urgent {
-            notify(paths, &tip.message);
+            notify::show(paths, &tip.message);
             if let Some(s) = states.get_mut(&tip.pane_id) {
                 s.last_notified_ms = Some(now);
             }
@@ -59,12 +60,4 @@ fn refresh_tips(paths: &PluginPaths) {
     if let Err(err) = tips::store(paths, &published) {
         eprintln!("analytics watch: tips write failed: {err:#}");
     }
-}
-
-fn notify(paths: &PluginPaths, body: &str) {
-    let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
-    let _ = std::process::Command::new(bin)
-        .args(["notification", "show", "analytics", "--body", body])
-        .env("HERDR_PLUGIN_STATE_DIR", &paths.state_dir)
-        .status();
 }
