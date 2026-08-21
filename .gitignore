@@ -2,3 +2,6 @@
 /bin
 /.forge
 /docs
+
+# README demo asset
+!/docs/tui-demo.gif
