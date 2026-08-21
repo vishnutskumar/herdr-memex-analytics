@@ -1,0 +1,57 @@
+# herdr-memex-analytics as a herdr plugin: efficiency analytics plus realtime
+# guidance for the agents running in your panes.
+#
+# Reads what memex already indexed (sessions, token usage, cache waste) and keeps
+# a warm snapshot refreshed by a background daemon on a fixed cadence — the same
+# model as memex's periodic reindex. Inside herdr it becomes a native pane: the
+# retro report for "where did my time and tokens go", and the daemon for
+# realtime tips while you work.
+#
+# The version here must match Cargo.toml.
+id = "vishnutskumar.memex-analytics"
+name = "memex-analytics"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+platforms = ["macos", "linux"]
+description = "Session efficiency analytics and realtime guidance for herdr, backed by memex history."
+
+# On `herdr plugin install`, build the analytics binary from this checkout into
+# bin/. Skipped by `herdr plugin link` — from a linked checkout run
+# `cargo build --release` first and the scripts pick up target/release/analytics.
+[[build]]
+command = ["bash", "herdr/install.sh"]
+
+# The efficiency report, auto-refreshing: renders from the daemon snapshot when
+# fresh, rescans when not.
+[[panes]]
+id = "report"
+title = "analytics"
+placement = "split"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/herdr/analytics-pane.sh\" report"]
+
+# Open the report beside your work, or close it if one is already open.
+[[actions]]
+id = "toggle"
+title = "analytics: toggle report pane"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/plugin.sh", "toggle"]
+
+# One-shot report into the pane (same surface, no toggle logic).
+[[actions]]
+id = "report"
+title = "analytics: efficiency report"
+command = ["bash", "herdr/plugin.sh", "report"]
+
+# Realtime guidance: herdr invokes the hook on every agent status transition.
+# The hook records the transition (feeding the daemon's tip engine) and
+# notifies immediately when an agent blocks. min_herdr_version must cover
+# plugin events.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["bash", "herdr/plugin.sh", "event-hook"]
+
+# Once per herdr session start: run the snapshot daemon in the background so the
+# report and realtime tips stay warm. Never blocks session start and never
+# reports failure. Cadence comes from $HERDR_PLUGIN_STATE_DIR/config.toml.
+[[startup]]
+command = ["bash", "herdr/plugin.sh", "startup"]
