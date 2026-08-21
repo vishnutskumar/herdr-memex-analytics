@@ -97,17 +97,33 @@ event-hook)
   exec "$BIN" event-hook
   ;;
 
+daemon)
+  # Start (or leave running) the snapshot daemon. Uses the runtime state dir
+  # when herdr provides one, else the standard plugin config path, so the
+  # daemon writes where panes and hooks read.
+  BIN=$(resolve_analytics) || refuse "analytics binary not found"
+  dir="${HERDR_PLUGIN_STATE_DIR:-$HOME/.config/herdr/plugins/config/$PLUGIN_ID}"
+  mkdir -p "$dir"
+  if pgrep -f "analytics watch" >/dev/null 2>&1; then
+    printf 'analytics daemon already running\n'
+    exit 0
+  fi
+  nohup "$BIN" watch >>"$dir/watch.log" 2>&1 </dev/null &
+  printf 'analytics daemon started (log: %s/watch.log)\n' "$dir"
+  ;;
+
 startup)
-  # Silent and non-blocking: the daemon runs detached; a missing binary or state
-  # dir just means no warm snapshot until the next successful start.
+  # Session start: same surface as `daemon`, but silent — a startup hook must
+  # never block or report failure.
   BIN=$(resolve_analytics) || exit 0
-  dir=$(state_dir) || exit 0
+  dir="${HERDR_PLUGIN_STATE_DIR:-$HOME/.config/herdr/plugins/config/$PLUGIN_ID}"
+  mkdir -p "$dir" 2>/dev/null || exit 0
   pgrep -f "analytics watch" >/dev/null 2>&1 && exit 0
   nohup "$BIN" watch >>"$dir/watch.log" 2>&1 </dev/null &
   exit 0
   ;;
 
 *)
-  refuse "unknown mode '$mode' (report | toggle | close | event-hook | startup)"
+  refuse "unknown mode '$mode' (report | toggle | close | event-hook | daemon | startup)"
   ;;
 esac
