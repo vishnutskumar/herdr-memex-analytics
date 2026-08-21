@@ -138,7 +138,7 @@ fn generated_label(at_ms: u64) -> String {
     format!("  (generated {})", rel_time(at_ms, report::now_ms()))
 }
 
-fn rel_time(then_ms: u64, now_ms: u64) -> String {
+pub(crate) fn rel_time(then_ms: u64, now_ms: u64) -> String {
     let secs = now_ms.saturating_sub(then_ms) / 1000;
     match secs {
         0..=59 => format!("{secs}s"),
@@ -148,7 +148,7 @@ fn rel_time(then_ms: u64, now_ms: u64) -> String {
     }
 }
 
-fn human_tokens(n: u64) -> String {
+pub(crate) fn human_tokens(n: u64) -> String {
     match n {
         0..=999 => n.to_string(),
         1_000..=999_999 => format!("{:.1}K", n as f64 / 1_000.0),

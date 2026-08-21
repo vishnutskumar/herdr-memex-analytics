@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::config::PluginPaths;
@@ -26,11 +26,5 @@ pub fn load(paths: &PluginPaths) -> Tips {
 
 /// Atomic write so a pane render never reads a half-written file.
 pub fn store(paths: &PluginPaths, tips: &Tips) -> Result<()> {
-    fs::create_dir_all(&paths.state_dir)
-        .with_context(|| format!("creating {}", paths.state_dir.display()))?;
-    let tmp = tips_path(paths).with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec(tips)?)
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, tips_path(paths))?;
-    Ok(())
+    crate::config::store_json(tips_path(paths), tips)
 }

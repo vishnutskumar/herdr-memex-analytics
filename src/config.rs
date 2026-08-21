@@ -66,16 +66,20 @@ pub fn snapshot_path(paths: &PluginPaths) -> PathBuf {
     paths.state_dir.join("snapshot.json")
 }
 
+/// Atomic JSON write so a reader never sees a half-written file.
+pub(crate) fn store_json<T: serde::Serialize>(path: PathBuf, value: &T) -> Result<()> {
+    let dir = path.parent().context("state path has no parent")?;
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec(value)?)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    Ok(())
+}
+
 /// Atomic write so a pane render never reads a half-written snapshot.
 pub fn write_snapshot(paths: &PluginPaths, report: &Report) -> Result<()> {
-    fs::create_dir_all(&paths.state_dir)
-        .with_context(|| format!("creating {}", paths.state_dir.display()))?;
-    let tmp = snapshot_path(paths).with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec(report)?)
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, snapshot_path(paths))
-        .with_context(|| format!("renaming into {}", snapshot_path(paths).display()))?;
-    Ok(())
+    store_json(snapshot_path(paths), report)
 }
 
 pub fn read_snapshot(paths: &PluginPaths) -> Option<Report> {

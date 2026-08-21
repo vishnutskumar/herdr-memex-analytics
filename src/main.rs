@@ -1,5 +1,6 @@
 mod agents;
 mod config;
+mod notify;
 mod render;
 mod report;
 mod tips;
@@ -7,6 +8,7 @@ mod tui;
 mod watch;
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -93,6 +95,11 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = PluginPaths::new(cli.state_dir.clone())?;
     let cfg = config::Config::load(&paths);
+    let filters = |since_ms, project: Option<String>| report::Filters {
+        root: cli.root.clone(),
+        since_ms,
+        project,
+    };
 
     match cli.cmd {
         Cmd::Report {
@@ -104,11 +111,7 @@ fn run() -> Result<()> {
             interval_secs,
         } => {
             let since_ms = parse_since(since.as_deref(), all)?;
-            let filters = report::Filters {
-                root: cli.root.clone(),
-                since_ms,
-                project,
-            };
+            let filters = filters(since_ms, project);
             if watch {
                 loop {
                     render::print_cleared(&filters, &paths, json)
@@ -120,12 +123,7 @@ fn run() -> Result<()> {
             print!("{text}");
         }
         Cmd::Ui => {
-            let filters = report::Filters {
-                root: cli.root.clone(),
-                since_ms: None,
-                project: None,
-            };
-            tui::run(&filters, &paths)?;
+            tui::run(&filters(None, None), &paths)?;
         }
         Cmd::Snapshot {
             since,
@@ -133,11 +131,7 @@ fn run() -> Result<()> {
             all,
         } => {
             let since_ms = parse_since(since.as_deref(), all)?;
-            let filters = report::Filters {
-                root: cli.root.clone(),
-                since_ms,
-                project,
-            };
+            let filters = filters(since_ms, project);
             let rep = report::gather(&filters)?;
             config::write_snapshot(&paths, &rep)?;
             eprintln!(
@@ -157,13 +151,9 @@ fn run() -> Result<()> {
         Cmd::Watch { scan_interval_secs } => {
             let interval = scan_interval_secs.unwrap_or(cfg.scan_interval_secs);
             watch::run(
-                report::Filters {
-                    root: cli.root.clone(),
-                    // The daemon always maintains the full-window snapshot; `report`
-                    // narrows it client-side when it can, and rescans when it cannot.
-                    since_ms: None,
-                    project: None,
-                },
+                // The daemon always maintains the full-window snapshot; `report`
+                // narrows it client-side when it can, and rescans when it cannot.
+                filters(None, None),
                 &paths,
                 Duration::from_secs(interval),
             )?;
@@ -198,11 +188,8 @@ fn event_hook(paths: &PluginPaths, raw: &str) -> Result<()> {
     agents::store_states(paths, &states)?;
 
     if result.entered_blocked {
-        let who = transition
-            .agent
-            .clone()
-            .unwrap_or_else(|| "agent".to_string());
-        notify(
+        let who = transition.agent.as_deref().unwrap_or("agent");
+        notify::show(
             paths,
             &format!("{who} blocked — needs input ({})", transition.pane_id),
         );
@@ -216,7 +203,6 @@ fn event_hook(paths: &PluginPaths, raw: &str) -> Result<()> {
 /// Completed-turn log (JSONL): one line per working->idle/done transition.
 fn append_turn(paths: &PluginPaths, t: &agents::Transition, duration_ms: u64) -> Result<()> {
     fs::create_dir_all(&paths.state_dir)?;
-    use std::io::Write;
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -234,15 +220,6 @@ fn append_turn(paths: &PluginPaths, t: &agents::Transition, duration_ms: u64) ->
     Ok(())
 }
 
-/// herdr-native notification; never fails the hook.
-fn notify(paths: &PluginPaths, body: &str) {
-    let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
-    let _ = std::process::Command::new(bin)
-        .args(["notification", "show", "analytics", "--body", body])
-        .env("HERDR_PLUGIN_STATE_DIR", &paths.state_dir)
-        .status();
-}
-
 /// Accepts `Nd`, `Nh`, or `YYYY-MM-DD`; `--all` wins over any value.
 fn parse_since(spec: Option<&str>, all: bool) -> Result<Option<u64>> {
     if all {
@@ -250,17 +227,16 @@ fn parse_since(spec: Option<&str>, all: bool) -> Result<Option<u64>> {
     }
     let Some(spec) = spec else {
         // Default window: 30 days, matching the report's focus on recent efficiency.
-        let ms = chrono::Utc::now().timestamp_millis() as u64;
-        return Ok(Some(ms.saturating_sub(30 * 24 * 3600 * 1000)));
+        return Ok(Some(ago_ms(30 * 24 * 3600)));
     };
     let spec = spec.trim();
     if let Some(days) = spec.strip_suffix('d') {
         let n: u64 = days.parse().context("bad --since day count")?;
-        return Ok(relative_ms(n * 24 * 3600));
+        return Ok(Some(ago_ms(n * 24 * 3600)));
     }
     if let Some(hours) = spec.strip_suffix('h') {
         let n: u64 = hours.parse().context("bad --since hour count")?;
-        return Ok(relative_ms(n * 3600));
+        return Ok(Some(ago_ms(n * 3600)));
     }
     let date = chrono::NaiveDate::parse_from_str(spec, "%Y-%m-%d")
         .with_context(|| format!("bad --since value {spec:?} (use YYYY-MM-DD, Nd, or Nh)"))?;
@@ -270,7 +246,6 @@ fn parse_since(spec: Option<&str>, all: bool) -> Result<Option<u64>> {
     ))
 }
 
-fn relative_ms(secs: u64) -> Option<u64> {
-    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-    Some(now_ms.saturating_sub(secs * 1000))
+fn ago_ms(secs: u64) -> u64 {
+    report::now_ms().saturating_sub(secs * 1000)
 }
