@@ -79,7 +79,7 @@ memex (~/.memex)                    herdr
 
 memex's own code lives upstream; this repo only depends on it as a library and
 reads its index. Bugs in memex belong in the
-[memex fork](https://github.com/vishnutskumar/memex), not here.
+[memex fork](https://github.com/nicosuave/memex), not here.
 
 ## Development
 

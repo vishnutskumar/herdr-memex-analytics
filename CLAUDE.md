@@ -42,8 +42,8 @@ Pre-commit hooks enforce the universal checks, `cargo fmt`, and `cargo clippy`;
 
 ## memex boundary
 
-memex's own code lives upstream — bugs there get fixed in the fork
-(vishnutskumar/memex) and picked up via the git dependency, never vendored or
+memex's own code lives upstream — bugs there get fixed upstream
+(nicosuave/memex) and picked up via the git dependency, never vendored or
 patched from this repo. `Cargo.toml` pins `ort = "=2.0.0-rc.10"` to keep
 version unification with memex's ONNX runtime (rc.13 breaks memex's
 unconditional CoreML import on macOS); revisit when upstream fixes it.
