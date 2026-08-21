@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --verbose
+      - name: Run tests
+        run: cargo test --verbose -- --test-threads=1
+      - name: Personal details
+        run: |
+          files=$(git diff --name-only HEAD~1 2>/dev/null || git ls-files)
+          skip=scripts/check-personal.sh
+          found=0
+          patterns=('/Users/' '/home/[a-z0-9_-]+' '@[A-Za-z0-9.-]+\.local\b' 'Vishnus-MacBook')
+          for f in $files; do
+            [ "$f" = "$skip" ] && continue
+            [ -f "$f" ] || continue
+            for pat in "${patterns[@]}"; do
+              if grep -inE "$pat" "$f" >/dev/null; then
+                echo "personal detail in $f ($pat)" >&2
+                found=1
+              fi
+            done
+          done
+          exit $found
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check --warn warnings

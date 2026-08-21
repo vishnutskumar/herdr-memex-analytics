@@ -30,6 +30,11 @@ repos:
 
   - repo: local
     hooks:
+      - id: check-personal
+        name: personal details
+        entry: scripts/check-personal.sh
+        language: system
+        pass_filenames: false
       - id: cargo-fmt
         name: cargo fmt
         entry: cargo fmt --all --
@@ -55,4 +60,4 @@ repos:
         language: system
         types: [rust]
         pass_filenames: false
-        stages: [pre-push]
+        stages: [pre-commit]
