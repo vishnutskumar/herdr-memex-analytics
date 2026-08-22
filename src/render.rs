@@ -29,6 +29,7 @@ pub(crate) fn load_report_shared(filters: &Filters, paths: &PluginPaths) -> Repo
         projects: vec![],
         usage: None,
         usage_note: Some(format!("scan failed: {err:#}")),
+        project_usage: vec![],
     })
 }
 
@@ -94,6 +95,14 @@ fn render_text(rep: &Report, live: &crate::tips::Tips) -> String {
                 human_tokens(u.total_tokens),
                 u.known_cost_usd
             ));
+            match u.cache_hit_rate {
+                Some(rate) => out.push_str(&format!(
+                    "  cache hit-rate: {:.1}% of {} prompt tokens\n",
+                    rate * 100.0,
+                    human_tokens(u.input_tokens)
+                )),
+                None => out.push_str("  cache hit-rate: n/a (no prompt tokens)\n"),
+            }
             out.push_str(&format!(
                 "  cache waste: {} tokens (${:.2}) across {} misses\n",
                 human_tokens(u.missed_tokens),
@@ -113,6 +122,36 @@ fn render_text(rep: &Report, live: &crate::tips::Tips) -> String {
                     s.known_cost_usd,
                     human_tokens(s.missed_tokens),
                 ));
+            }
+            if !u.by_model.is_empty() {
+                out.push_str(&format!(
+                    "\n  {:<20.20} {:>6} {:>10} {:>9}\n",
+                    "model", "events", "tokens", "cost"
+                ));
+                for m in &u.by_model {
+                    out.push_str(&format!(
+                        "  {:<20.20} {:>6} {:>10} ${:>8.2}\n",
+                        m.model,
+                        m.events,
+                        human_tokens(m.total_tokens),
+                        m.known_cost_usd
+                    ));
+                }
+            }
+            if !rep.project_usage.is_empty() {
+                out.push_str(&format!(
+                    "\n  {:<28.28} {:>6} {:>10} {:>9}\n",
+                    "project", "events", "tokens", "cost"
+                ));
+                for p in rep.project_usage.iter().take(5) {
+                    out.push_str(&format!(
+                        "  {:<28.28} {:>6} {:>10} ${:>8.2}\n",
+                        p.project,
+                        p.events,
+                        human_tokens(p.total_tokens),
+                        p.known_cost_usd
+                    ));
+                }
             }
             out.push_str("\n  tip: idle-gap misses mean returning after the cache went cold —\n");
             out.push_str("  batching related prompts into one session keeps it warm.\n");
@@ -216,6 +255,7 @@ mod tests {
             ],
             usage: None,
             usage_note: Some("disabled; set token_usage = true in config.toml".into()),
+            project_usage: vec![],
         }
     }
 
@@ -304,12 +344,20 @@ mod tests {
                 known_cost_usd: 1.5,
                 missed_tokens: 4_000,
             }],
+            cache_read_tokens: 15_000,
+            input_tokens: 20_000,
+            cache_hit_rate: Some(0.75),
+            by_model: vec![],
         });
         seed_snapshot(&paths, rep);
         let out = render(&nowhere_filters(), &paths, false).unwrap();
         assert!(out.contains("Token usage"), "{out}");
         assert!(out.contains("25.0K tokens"), "{out}");
         assert!(out.contains("$1.50 known cost"), "{out}");
+        assert!(
+            out.contains("cache hit-rate: 75.0% of 20.0K prompt tokens"),
+            "{out}"
+        );
         assert!(
             out.contains("idle-gap misses 2, model-switch misses 1"),
             "{out}"
