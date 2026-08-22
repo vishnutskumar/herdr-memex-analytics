@@ -27,7 +27,10 @@ token usage and cache-waste analysis.
    switching models mid-task. The actionable advice is batching related work
    into contiguous sessions.
 5. **Distinguish cost certainty.** `known_cost_usd` covers only priced events;
-   say so when quoting dollar figures rather than implying exact totals.
+   say so when quoting dollar figures rather than implying exact totals. This
+   goes for per-project figures too: `project_usage.missed_cost_usd` is always
+   0.0 — waste cost is only known at the digest level (`usage.missed_cost_usd`)
+   — so rank projects by known cost and say "known cost".
 6. **Turn durations come from herdr events**, not memex: `turns.jsonl` in the
    plugin state dir holds one line per completed working segment. Read it
    directly for "how long are my agent turns" questions.
@@ -37,10 +40,13 @@ token usage and cache-waste analysis.
 | User intent | First move |
 | --- | --- |
 | "how much am I spending" | `analytics report --since 30d --json` → `usage.known_cost_usd`, `usage.by_source` |
-| "why is my bill high" | same, then rank `by_source` and check `cache_waste.missed_cost_usd` share |
+| "why is my bill high" | same, then rank `by_source` and check `usage.missed_cost_usd` share |
+| "which model costs me the most" | `report --json --since Nd` → rank `usage.by_model` by `known_cost_usd` (already sorted by tokens desc) |
 | "which project eats my time" | `report --json` → sort `projects` by `active_ms` |
+| "which project burns budget" | `report --json` → `project_usage`, ranked by `known_cost_usd` (top 10) |
 | "efficiency this week" | `report --since 7d --json` |
-| "am I using the cache well" | `cache_waste`: compare `missed_tokens` against total input; high `idle_misses` = fragmented sessions |
+| "am I using the cache well" | `usage`: compare `missed_tokens` against total input; high `idle_misses` = fragmented sessions |
+| "is my cache working" | `usage.cache_hit_rate` = `cache_read_tokens / input_tokens`, where the denominator (`input_tokens`) is uncached input + cache read + cache write; pair with `missed_tokens`/`idle_misses` |
 | "how long are agent turns" | read `$HERDR_PLUGIN_STATE_DIR/turns.jsonl` (default `~/.herdr-memex-analytics/turns.jsonl`), summarize `duration_ms` |
 | "is anything stuck right now" | read `agent-states.json` in the state dir; status `blocked` with old `since_ms` |
 

@@ -16,7 +16,9 @@ time across projects — numbers nobody had looked at before.
 volume, active hours, and (when memex token-usage tracking is enabled) tokens,
 known cost, and **prompt-cache waste** — tokens you paid input rates for that a
 warm cache would have served. Includes where the waste came from (idle-gap
-misses, model switches).
+misses, model switches), the **cache hit-rate** (share of prompt tokens served
+from cache), the **model mix** behind the spend, and **per-project cost
+attribution** (top projects by known cost).
 
 **Realtime guidance** — a manifest event hook fires on every agent status
 transition. You get a Herdr notification the moment an agent blocks, the daemon
@@ -51,8 +53,7 @@ matches, and then a Rust toolchain is needed.
 |---|---|
 | `analytics: toggle report pane` action | Open/close the auto-refreshing report beside your work |
 | `analytics: efficiency report` action | Open the report pane |
-| `report` pane | Live report + current tips, re-rendered every 30 s (`q` quit, `j/k` move, `r` rescan) |
-| `[[startup]]` hook | Starts the snapshot daemon in the background |
+| `report` pane | Live report + current tips, re-rendered every 30 s (`q` quit, `j/k` or mouse wheel move, `r` rescan; table border shows the selected row as `sel/total`) |
 | `pane.agent_status_changed` hook | Records transitions, notifies on blocked agents |
 
 ### Keybinding
