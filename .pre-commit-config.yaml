@@ -61,3 +61,19 @@ repos:
         types: [rust]
         pass_filenames: false
         stages: [pre-commit]
+      - id: check-version-bump
+        name: version bump guard
+        entry: scripts/check-version-bump.sh
+        language: system
+        pass_filenames: false
+        files: ^(src/.*|tests/.*|herdr-plugin\.toml|Cargo\.toml)$
+        stages: [pre-commit]
+      # Runs on pre-push only: regenerating the gif requires a release build,
+      # which is far too slow for every commit.
+      - id: check-tui-gif
+        name: tui gif freshness
+        entry: scripts/check-tui-gif.sh
+        language: system
+        pass_filenames: false
+        files: ^src/(tui|render)\.rs$
+        stages: [pre-push]
