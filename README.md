@@ -18,12 +18,28 @@ known cost, and **prompt-cache waste** — tokens you paid input rates for that 
 warm cache would have served. Includes where the waste came from (idle-gap
 misses, model switches), the **cache hit-rate** (share of prompt tokens served
 from cache), the **model mix** behind the spend, and **per-project cost
-attribution** (top projects by known cost).
+attribution** (top projects by known cost). An activity section adds a daily
+cost sparkline, trailing-hour burn rate and today's spend, a week-over-week
+delta when the window has a bounded start (`--since`), reasoning-token share,
+and a warning when a session's uncached prompt keeps growing past
+`context_bloat_tokens`.
+
+**Turn quality** — completed turns are summarized as p50/p95 durations, an
+intervention rate (share of turns that ended blocked), rework turns (quick
+follow-ups right after a blocked turn), and how long humans took to unblock
+agents.
+
+**Live fleet** — each daemon cycle samples `herdr api snapshot` and reports
+how many agents are working, blocked, or idle right now, plus per-pane revision
+churn.
 
 **Realtime guidance** — a manifest event hook fires on every agent status
 transition. You get a Herdr notification the moment an agent blocks, the daemon
 re-nags if one stays blocked, and long single turns get flagged. Completed-turn
-durations are logged for later analysis.
+durations are logged for later analysis. Repeated output matches in a pane
+(retry loops) become an urgent tip, and budget alerts fire when today's spend
+passes `daily_cost_usd` (once per local day) or the trailing-hour burn rate
+exceeds `block_burn_rate_usd_hr` (at most once per hour).
 
 **Auto-refresh** — like memex's periodic reindex, a background daemon (started
 by the plugin's `[[startup]]` hook) rescans on a fixed cadence (default 15 min)
@@ -53,7 +69,7 @@ matches, and then a Rust toolchain is needed.
 |---|---|
 | `analytics: toggle report pane` action | Open/close the auto-refreshing report beside your work |
 | `analytics: efficiency report` action | Open the report pane |
-| `report` pane | Live report + current tips, re-rendered every 30 s (`q` quit, `j/k` or mouse wheel move, `r` rescan; table border shows the selected row as `sel/total`) |
+| `report` pane | Live report + current tips, re-rendered every 30 s (`q` quit, `j/k` or mouse wheel move, `r` rescan, `c` cycle the activity chart between tokens/cost/sessions; table border shows the selected row as `sel/total`) |
 | `pane.agent_status_changed` hook | Records transitions, notifies on blocked agents |
 
 ### Keybinding
@@ -84,11 +100,18 @@ analytics watch --scan-interval-secs 600
 
 State lives under `$HERDR_PLUGIN_STATE_DIR` inside Herdr
 (`~/.herdr-memex-analytics` standalone): `snapshot.json`, `agent-states.json`,
-`turns.jsonl`, `tips.json`, and an optional `config.toml`:
+`turns.jsonl`, `gaps.jsonl`, `tips.json`, and an optional `config.toml`:
 
 ```toml
-scan_interval_secs = 900   # daemon rescan cadence
+scan_interval_secs = 900              # daemon rescan cadence
+daily_cost_usd = 20.0                # alert when today's spend passes this (omit to disable)
+block_burn_rate_usd_hr = 15.0        # alert when trailing-hour burn rate exceeds this
+context_bloat_tokens = 100_000       # flag sessions whose uncached prompt grows past this
 ```
+
+The TUI dashboard (`analytics ui`) adds a braille activity chart over the
+daily series (`c` cycles tokens/cost/sessions) and a 7x24 heatmap of which
+hours of the last seven days saw the most token traffic.
 
 ## Agent skill
 
