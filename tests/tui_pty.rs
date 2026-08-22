@@ -410,20 +410,38 @@ fn titles_in(screen: &str) -> Vec<(u64, u64)> {
 
 const BRAILLE_RAMP: [char; 4] = ['\u{28c0}', '\u{28e4}', '\u{28f6}', '\u{28ff}'];
 
-/// Mode word ("tokens"|"cost"|"sessions") of the activity chart. The harness
-/// normalizes the screen to a single whitespace-joined line, so the discovery
-/// protocol's "mode word within two lines above the braille row" collapses
-/// into that line; in the fixture dashboard (no usage data) the chart title is
-/// the only carrier of these words. A braille ramp row must be present.
+/// Mode word ("tokens"|"cost"|"sessions") of the activity chart, read from
+/// its `Activity · <mode>` panel title. A braille ramp row must be present.
 fn chart_mode_word(screen: &str) -> Option<String> {
     if !screen.chars().any(|c| BRAILLE_RAMP.contains(&c)) {
         return None;
     }
     let lower = screen.to_ascii_lowercase();
-    ["tokens", "cost", "sessions"]
-        .iter()
-        .find(|word| lower.contains(*word))
-        .map(|word| (*word).to_string())
+    let rest = &lower[lower.find("activity")? + "activity".len()..];
+    let word: String = rest
+        .chars()
+        .skip_while(|c| !c.is_ascii_alphabetic())
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
+    Some(word)
+}
+
+/// Press `c` until the chart title reads `expected`; re-feeding is safe
+/// because the mode list wraps.
+fn cycle_until(tui: &mut Tui, expected: &str) {
+    let deadline = Instant::now() + KEY_TIMEOUT;
+    loop {
+        let m = tui.mark();
+        tui.feed(b"c");
+        let screen = tui.screen_after_input(m, KEY_TIMEOUT);
+        if chart_mode_word(&screen).as_deref() == Some(expected) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "chart mode never reached {expected:?}; screen: {screen}"
+        );
+    }
 }
 
 fn wheel_down(col: u32, row: u32) -> Vec<u8> {
@@ -655,24 +673,16 @@ fn c_cycles_chart_mode_tokens_cost_sessions() {
     let mut tui = Tui::spawn(&fx);
 
     assert!(tui.wait_text("Sessions 1/3", PAINT_TIMEOUT));
-    // The first frame streams row by row; wait for it to settle so the
-    // activity chart below the usage panel is included.
-    tui.quiesce(QUIESCE_IDLE, PAINT_TIMEOUT);
-    let s0 = tui.screen_from(0);
-    assert_eq!(
-        chart_mode_word(&s0),
-        Some("tokens".into()),
-        "chart starts in tokens mode; screen: {s0}"
-    );
-
-    for expected in ["cost", "sessions", "tokens"] {
-        let m = tui.mark();
-        tui.feed(b"c");
-        let screen = tui.screen_after_input(m, KEY_TIMEOUT);
-        assert_eq!(
-            chart_mode_word(&screen),
-            Some(expected.into()),
-            "c should cycle chart mode to {expected}; screen: {screen}"
+    // Wait for the first full frame so the activity chart is painted.
+    let deadline = Instant::now() + PAINT_TIMEOUT;
+    while chart_mode_word(&tui.screen_from(0)) != Some("tokens".into()) {
+        assert!(
+            Instant::now() < deadline,
+            "chart never painted in tokens mode"
         );
+        tui.quiesce(QUIESCE_IDLE, PAINT_TIMEOUT);
+    }
+    for expected in ["cost", "sessions", "tokens"] {
+        cycle_until(&mut tui, expected);
     }
 }
