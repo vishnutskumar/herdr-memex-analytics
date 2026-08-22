@@ -126,6 +126,7 @@ mod tests {
             }],
             usage: None,
             usage_note: Some("disabled".into()),
+            project_usage: vec![],
         }
     }
 

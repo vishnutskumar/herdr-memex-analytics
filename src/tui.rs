@@ -7,13 +7,16 @@ use ratatui::{
     backend::CrosstermBackend,
     crossterm::{
         ExecutableCommand,
-        event::{self, Event, KeyCode, KeyEventKind},
+        event::{
+            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+            MouseEventKind,
+        },
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     },
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
 };
 
 use crate::render::{human_tokens, rel_time};
@@ -27,13 +30,17 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 /// Full-screen dashboard for the herdr pane, in the spirit of `memex tui`:
 /// live tips on top, selectable project table on the left, token-usage panel
-/// on the right. `q` quits, `r` forces a rescan, `j/k` move.
+/// on the right. `q` quits, `r` forces a rescan, `j/k` or the scroll wheel move.
 pub fn run(filters: &Filters, paths: &crate::config::PluginPaths) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
-    let mut terminal: Tui = Terminal::new(CrosstermBackend::new(stdout))?;
-    let result = event_loop(&mut terminal, filters, paths);
+    stdout.execute(EnableMouseCapture)?;
+    let result = match Terminal::new(CrosstermBackend::new(stdout)) {
+        Ok(mut terminal) => event_loop(&mut terminal, filters, paths),
+        Err(err) => Err(err.into()),
+    };
+    io::stdout().execute(DisableMouseCapture)?;
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
     result
@@ -45,6 +52,7 @@ fn event_loop(
     paths: &crate::config::PluginPaths,
 ) -> Result<()> {
     let mut selected: usize = 0;
+    let mut table_state = TableState::default();
     let mut rep = crate::render::load_report_shared(filters, paths);
     let mut live = tips::load(paths);
     let mut last_refresh = Instant::now();
@@ -65,28 +73,38 @@ fn event_loop(
         let count = rep.projects.len();
         selected = count.checked_sub(1).map_or(0, |max| selected.min(max));
 
-        terminal.draw(|f| draw(f, &rep, &live, selected))?;
-
-        if event::poll(Duration::from_millis(250))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                KeyCode::Char('j') | KeyCode::Down => {
-                    if count > 0 {
-                        selected = (selected + 1).min(count - 1);
+        terminal.draw(|f| draw(f, &rep, &live, selected, &mut table_state))?;
+        if event::poll(Duration::from_millis(250))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        selected = selected.saturating_add(1).min(count.saturating_sub(1));
                     }
-                }
-                KeyCode::Char('k') | KeyCode::Up => selected = selected.saturating_sub(1),
-                KeyCode::Char('r') => force_rescan = true,
+                    KeyCode::Char('k') | KeyCode::Up => selected = selected.saturating_sub(1),
+                    KeyCode::Char('r') => force_rescan = true,
+                    _ => {}
+                },
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => selected = selected.saturating_sub(1),
+                    MouseEventKind::ScrollDown => {
+                        selected = selected.saturating_add(1).min(count.saturating_sub(1));
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         }
     }
 }
 
-fn draw(f: &mut Frame, rep: &Report, live: &tips::Tips, selected: usize) {
+fn draw(
+    f: &mut Frame,
+    rep: &Report,
+    live: &tips::Tips,
+    selected: usize,
+    table_state: &mut TableState,
+) {
     let tips_h = if live.items.is_empty() {
         0
     } else {
@@ -102,7 +120,7 @@ fn draw(f: &mut Frame, rep: &Report, live: &tips::Tips, selected: usize) {
 
     draw_header(f, header, rep);
     draw_tips(f, tips_area, live);
-    draw_body(f, body, rep, selected);
+    draw_body(f, body, rep, selected, table_state);
     draw_footer(f, footer);
 }
 
@@ -147,7 +165,13 @@ fn draw_tips(f: &mut Frame, area: Rect, live: &tips::Tips) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_body(f: &mut Frame, area: Rect, rep: &Report, selected: usize) {
+fn draw_body(
+    f: &mut Frame,
+    area: Rect,
+    rep: &Report,
+    selected: usize,
+    table_state: &mut TableState,
+) {
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).areas(area);
 
@@ -186,8 +210,17 @@ fn draw_body(f: &mut Frame, area: Rect, rep: &Report, selected: usize) {
         Row::new(vec!["project", "sess", "msgs", "hrs", "last"])
             .style(accent().add_modifier(Modifier::BOLD)),
     )
-    .block(Block::new().borders(Borders::ALL).title(" Sessions "));
-    f.render_widget(table, left);
+    .block(Block::new().title(format!(
+        " Sessions {}/{} ",
+        if rep.projects.is_empty() {
+            0
+        } else {
+            selected + 1
+        },
+        rep.projects.len()
+    )));
+    table_state.select(Some(selected));
+    f.render_stateful_widget(table, left, table_state);
 
     draw_usage(f, right, rep);
 }
@@ -203,6 +236,27 @@ fn draw_usage(f: &mut Frame, area: Rect, rep: &Report) {
                 &format!("${:.2}", u.known_cost_usd),
                 Color::Green,
             ));
+            match u.cache_hit_rate {
+                Some(rate) => {
+                    let color = if rate >= 0.60 {
+                        Color::Green
+                    } else if rate >= 0.30 {
+                        Color::Yellow
+                    } else {
+                        Color::Red
+                    };
+                    lines.push(kv_colored(
+                        "hit-rate",
+                        &format!(
+                            "{:.1}% of {} prompt tokens",
+                            rate * 100.0,
+                            human_tokens(u.input_tokens)
+                        ),
+                        color,
+                    ));
+                }
+                None => lines.push(kv("hit-rate", "n/a")),
+            }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "cache waste",
@@ -231,6 +285,23 @@ fn draw_usage(f: &mut Frame, area: Rect, rep: &Report) {
                         s.known_cost_usd
                     )),
                 ]));
+            }
+            if !u.by_model.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "top models",
+                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )));
+                for m in u.by_model.iter().take(3) {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{:<14.14}", m.model), accent()),
+                        Span::raw(format!(
+                            "{:>8}  ${:.2}",
+                            human_tokens(m.total_tokens),
+                            m.known_cost_usd
+                        )),
+                    ]));
+                }
             }
             lines.push(Line::from(""));
             for hint in [

@@ -10,7 +10,7 @@
 # The version here must match Cargo.toml.
 id = "vishnutskumar.memex-analytics"
 name = "memex-analytics"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.7.0"
 platforms = ["macos", "linux"]
 description = "Session efficiency analytics and realtime guidance for herdr, backed by memex history."

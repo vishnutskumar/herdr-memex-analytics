@@ -1,6 +1,6 @@
 [package]
 name = "herdr-memex-analytics"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Herdr plugin: session efficiency analytics and realtime guidance backed by memex"
 license = "MIT"

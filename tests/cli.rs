@@ -180,6 +180,8 @@ struct ReportJson {
     projects: Vec<ProjectJson>,
     usage: Option<serde_json::Value>,
     usage_note: Option<String>,
+    #[serde(default)]
+    project_usage: Vec<ProjectUsageJson>,
 }
 
 #[derive(serde::Deserialize)]
@@ -639,4 +641,395 @@ fn watch_survives_a_corrupted_database_scan() {
 
     assert!(ok, "tips.json written despite scan failures");
     assert!(still_alive, "daemon survived repeated scan failures");
+}
+
+// ---------------------------------------------------------------- usage intelligence
+
+#[derive(serde::Deserialize)]
+struct UsageJson {
+    events: u64,
+    total_tokens: u64,
+    cache_read_tokens: u64,
+    input_tokens: u64,
+    cache_hit_rate: Option<f64>,
+    by_model: Vec<ModelJson>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct ModelJson {
+    model: String,
+    events: u64,
+    total_tokens: u64,
+    known_cost_usd: f64,
+}
+
+#[derive(serde::Deserialize)]
+struct ProjectUsageJson {
+    project: String,
+    events: u64,
+    total_tokens: u64,
+    known_cost_usd: f64,
+    missed_cost_usd: f64,
+}
+
+struct UsageEventSpec {
+    cwd: Option<&'static str>,
+    model: Option<&'static str>,
+    input: u64,
+    cache_read: u64,
+    cache_write: u64,
+    output: u64,
+    cost_usd: Option<f64>,
+}
+
+/// Enable token usage and seed one fake claude transcript; returns the
+/// CLAUDE_CONFIG_DIR and a pinned HOME so the memex scanners see only the
+/// fixture, never the developer's real agent logs.
+fn seed_usage(fx: &Fixture, events: &[UsageEventSpec]) -> (String, String) {
+    let claude_dir = fx.root.join("claude-config");
+    let projects = claude_dir.join("projects").join("proj");
+    std::fs::create_dir_all(&projects).unwrap();
+    std::fs::write(fx.root.join("config.toml"), "token_usage = true\n").unwrap();
+    std::fs::create_dir_all(fx.root.join("home")).unwrap();
+
+    let ts = now_ms() - 60_000;
+    let mut body = String::new();
+    for (i, e) in events.iter().enumerate() {
+        let cwd = match e.cwd {
+            Some(cwd) => format!(r#""cwd":"{cwd}","#),
+            None => String::new(),
+        };
+        let model = match e.model {
+            Some(model) => format!(r#""model":"{model}","#),
+            None => String::new(),
+        };
+        let cost = match e.cost_usd {
+            Some(cost) => format!(r#","costUSD":{cost}"#),
+            None => String::new(),
+        };
+        body.push_str(&format!(
+            r#"{{"type":"assistant","sessionId":"s1",{cwd}"timestamp":{ts},"message":{{"id":"m{i}",{model}"usage":{{"input_tokens":{},"cache_read_input_tokens":{},"cache_creation_input_tokens":{},"output_tokens":{}}}}}{cost}}}"#,
+            e.input, e.cache_read, e.cache_write, e.output
+        ));
+        body.push('\n');
+    }
+    std::fs::write(projects.join("s1.jsonl"), body).unwrap();
+    (
+        claude_dir.to_string_lossy().into_owned(),
+        fx.root.join("home").to_string_lossy().into_owned(),
+    )
+}
+
+fn usage_report_json(fx: &Fixture, env: &[(&str, &str)]) -> (ReportJson, UsageJson) {
+    let out = run_with_env(fx, &["report", "--json", "--all"], env);
+    assert!(
+        out.status.success(),
+        "report failed: {} {}",
+        stderr(&out),
+        stdout(&out)
+    );
+    let rep: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let usage: UsageJson =
+        serde_json::from_value(rep["usage"].clone()).expect("usage digest in report JSON");
+    let rep: ReportJson = serde_json::from_value(rep).unwrap();
+    (rep, usage)
+}
+
+#[test]
+fn json_report_includes_model_mix_sorted_by_tokens() {
+    let fx = fixture("model-mix");
+    seed_db(&fx.root, &standard_rows(now_ms()));
+    let env = seed_usage(
+        &fx,
+        &[
+            UsageEventSpec {
+                cwd: Some("/w/alpha"),
+                model: Some("claude-sonnet-4-5"),
+                input: 1_000,
+                cache_read: 0,
+                cache_write: 0,
+                output: 500,
+                cost_usd: None,
+            },
+            UsageEventSpec {
+                cwd: Some("/w/alpha"),
+                model: Some("claude-opus-4-6"),
+                input: 200,
+                cache_read: 100,
+                cache_write: 50,
+                output: 30,
+                cost_usd: None,
+            },
+            UsageEventSpec {
+                cwd: Some("/w/alpha"),
+                model: Some("claude-haiku-4-5"),
+                input: 10,
+                cache_read: 5,
+                cache_write: 0,
+                output: 4,
+                cost_usd: None,
+            },
+        ],
+    );
+
+    let (_, usage) = usage_report_json(&fx, &[("CLAUDE_CONFIG_DIR", &env.0), ("HOME", &env.1)]);
+    let models: Vec<&str> = usage.by_model.iter().map(|m| m.model.as_str()).collect();
+    assert_eq!(
+        models,
+        vec!["claude-sonnet-4-5", "claude-opus-4-6", "claude-haiku-4-5"],
+        "models sorted by total tokens desc: {:?}",
+        usage.by_model
+    );
+    assert_eq!(usage.by_model[0].total_tokens, 1_500);
+    assert_eq!(usage.by_model[0].events, 1);
+    assert_eq!(usage.by_model[1].total_tokens, 380);
+    assert_eq!(usage.total_tokens, 1_899, "digest total matches model mix");
+    assert_eq!(usage.by_model[0].known_cost_usd, 0.0);
+    let model_events: u64 = usage.by_model.iter().map(|m| m.events).sum();
+    assert_eq!(
+        model_events, usage.events,
+        "every event lands in one bucket"
+    );
+}
+
+#[test]
+fn unknown_model_events_bucketed_under_unknown() {
+    let fx = fixture("unknown-model");
+    seed_db(&fx.root, &standard_rows(now_ms()));
+    let env = seed_usage(
+        &fx,
+        &[
+            UsageEventSpec {
+                cwd: Some("/w/alpha"),
+                model: None,
+                input: 100,
+                cache_read: 0,
+                cache_write: 0,
+                output: 10,
+                cost_usd: None,
+            },
+            UsageEventSpec {
+                cwd: Some("/w/alpha"),
+                model: Some(""),
+                input: 50,
+                cache_read: 0,
+                cache_write: 0,
+                output: 5,
+                cost_usd: None,
+            },
+            UsageEventSpec {
+                cwd: Some("/w/alpha"),
+                model: Some("claude-sonnet-4-5"),
+                input: 20,
+                cache_read: 0,
+                cache_write: 0,
+                output: 2,
+                cost_usd: None,
+            },
+        ],
+    );
+
+    let (_, usage) = usage_report_json(&fx, &[("CLAUDE_CONFIG_DIR", &env.0), ("HOME", &env.1)]);
+    let unknown: Vec<&ModelJson> = usage
+        .by_model
+        .iter()
+        .filter(|m| m.model == "unknown")
+        .collect();
+    assert_eq!(
+        unknown.len(),
+        1,
+        "missing and empty models share one bucket"
+    );
+    assert_eq!(unknown[0].events, 2);
+    assert_eq!(unknown[0].total_tokens, 165);
+}
+
+#[test]
+fn cache_hit_rate_bounds_and_none_when_no_prompt_tokens() {
+    let fx = fixture("hit-rate");
+    seed_db(&fx.root, &standard_rows(now_ms()));
+    let env = seed_usage(
+        &fx,
+        &[
+            // prompt denominator = uncached 300 + read 600 + write 100 = 1000.
+            UsageEventSpec {
+                cwd: Some("/w/alpha"),
+                model: Some("claude-sonnet-4-5"),
+                input: 300,
+                cache_read: 600,
+                cache_write: 100,
+                output: 50,
+                cost_usd: None,
+            },
+            // Output-only request: no prompt tokens, must not dilute the rate.
+            UsageEventSpec {
+                cwd: Some("/w/alpha"),
+                model: Some("claude-sonnet-4-5"),
+                input: 0,
+                cache_read: 0,
+                cache_write: 0,
+                output: 999,
+                cost_usd: None,
+            },
+        ],
+    );
+
+    let (_, usage) = usage_report_json(&fx, &[("CLAUDE_CONFIG_DIR", &env.0), ("HOME", &env.1)]);
+    assert_eq!(usage.input_tokens, 1_000);
+    assert_eq!(usage.cache_read_tokens, 600);
+    let rate = usage
+        .cache_hit_rate
+        .expect("rate defined with prompt tokens");
+    assert!((0.0..=1.0).contains(&rate), "rate bounded: {rate}");
+    assert!(
+        (rate - 0.6).abs() < 1e-9,
+        "reads over prompt tokens: {rate}"
+    );
+
+    // A window with only output-only traffic has no denominator at all.
+    let fx = fixture("hit-rate-none");
+    seed_db(&fx.root, &standard_rows(now_ms()));
+    let env = seed_usage(
+        &fx,
+        &[UsageEventSpec {
+            cwd: Some("/w/alpha"),
+            model: Some("claude-sonnet-4-5"),
+            input: 0,
+            cache_read: 0,
+            cache_write: 0,
+            output: 42,
+            cost_usd: None,
+        }],
+    );
+    let (_, usage) = usage_report_json(&fx, &[("CLAUDE_CONFIG_DIR", &env.0), ("HOME", &env.1)]);
+    assert_eq!(usage.input_tokens, 0);
+    assert_eq!(usage.cache_read_tokens, 0);
+    assert!(
+        usage.cache_hit_rate.is_none(),
+        "no prompt tokens means no rate"
+    );
+}
+
+#[test]
+fn project_usage_ranked_by_cost_with_unknown_fallback() {
+    let fx = fixture("project-cost");
+    seed_db(&fx.root, &standard_rows(now_ms()));
+    let env = seed_usage(
+        &fx,
+        &[
+            UsageEventSpec {
+                cwd: Some("/w/alpha"),
+                model: Some("claude-sonnet-4-5"),
+                input: 100,
+                cache_read: 0,
+                cache_write: 0,
+                output: 10,
+                cost_usd: Some(0.50),
+            },
+            UsageEventSpec {
+                cwd: Some("/w/alpha"),
+                model: Some("claude-sonnet-4-5"),
+                input: 100,
+                cache_read: 0,
+                cache_write: 0,
+                output: 10,
+                cost_usd: Some(0.25),
+            },
+            UsageEventSpec {
+                cwd: Some("/w/beta"),
+                model: Some("claude-sonnet-4-5"),
+                input: 100,
+                cache_read: 0,
+                cache_write: 0,
+                output: 10,
+                cost_usd: Some(2.25),
+            },
+            UsageEventSpec {
+                cwd: None,
+                model: Some("claude-sonnet-4-5"),
+                input: 100,
+                cache_read: 0,
+                cache_write: 0,
+                output: 10,
+                cost_usd: Some(9.99),
+            },
+        ],
+    );
+    let (rep, usage) = usage_report_json(&fx, &[("CLAUDE_CONFIG_DIR", &env.0), ("HOME", &env.1)]);
+    let projects: Vec<&str> = rep
+        .project_usage
+        .iter()
+        .map(|p| p.project.as_str())
+        .collect();
+    assert_eq!(
+        projects,
+        vec!["unknown", "/w/beta", "/w/alpha"],
+        "ranked by known cost desc, missing cwd falls back to unknown"
+    );
+    assert_eq!(rep.project_usage[0].known_cost_usd, 9.99);
+    assert_eq!(rep.project_usage[1].known_cost_usd, 2.25);
+    assert_eq!(
+        rep.project_usage[2].known_cost_usd, 0.75,
+        "per-project costs aggregate"
+    );
+    assert_eq!(rep.project_usage[2].events, 2);
+    assert_eq!(rep.project_usage[2].total_tokens, 220);
+    assert!(
+        (usage.by_model[0].known_cost_usd - 12.99).abs() < 1e-9,
+        "per-model cost aggregates provider-reported figures"
+    );
+    assert!(
+        rep.project_usage.iter().all(|p| p.missed_cost_usd == 0.0),
+        "per-project missed cost is not fabricable from public per-event fields"
+    );
+}
+
+#[test]
+fn old_snapshot_without_new_fields_still_renders() {
+    let fx = fixture("old-snapshot");
+    std::fs::create_dir_all(&fx.state_dir).unwrap();
+    let pre_feature = format!(
+        r#"{{"generated_at_ms":{},"since_ms":null,"projects":[],"usage":{{"events":3,"total_tokens":1000,"known_cost_usd":0.5,"missed_tokens":10,"missed_cost_usd":0.01,"miss_count":1,"idle_misses":0,"model_switch_misses":0,"by_source":[]}},"usage_note":null}}"#,
+        now_ms()
+    );
+    std::fs::write(fx.state_dir.join("snapshot.json"), pre_feature).unwrap();
+
+    let rep = report_json(&fx, &["--all"]);
+    let usage = rep.usage.expect("digest survives the round trip");
+    let usage: serde_json::Value = serde_json::to_value(&usage).unwrap();
+    assert_eq!(usage["events"], 3);
+    assert!(
+        usage["cache_hit_rate"].is_null(),
+        "default is null: {usage}"
+    );
+    assert_eq!(usage["by_model"], serde_json::json!([]));
+    assert_eq!(usage["input_tokens"], 0);
+    assert!(rep.project_usage.is_empty());
+
+    let text = run(&fx, &["report", "--all"]);
+    assert!(text.status.success(), "{}", stderr(&text));
+    assert!(
+        stdout(&text).contains("cache hit-rate: n/a"),
+        "{}",
+        stdout(&text)
+    );
+}
+
+#[test]
+fn usage_disabled_leaves_usage_none_and_omits_new_sections() {
+    let fx = fixture("usage-disabled");
+    seed_db(&fx.root, &standard_rows(now_ms()));
+
+    let rep = report_json(&fx, &["--all"]);
+    assert!(rep.usage.is_none());
+    assert!(rep.usage_note.is_some());
+    assert!(
+        rep.project_usage.is_empty(),
+        "no attribution without usage tracking"
+    );
+
+    let text = stdout(&run(&fx, &["report", "--all"]));
+    assert!(text.contains("Token usage: unavailable"), "{text}");
+    assert!(!text.contains("cache hit-rate"), "{text}");
+    assert!(!text.contains("model"), "no model table either: {text}");
 }

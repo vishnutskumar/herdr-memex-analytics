@@ -39,6 +39,34 @@ pub struct UsageDigest {
     pub idle_misses: u64,
     pub model_switch_misses: u64,
     pub by_source: Vec<SourceDigest>,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// Prompt-token denominator of `cache_hit_rate`, mirroring memex's
+    /// cache-chain definition: uncached_input + cache_read + cache_write.
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// cache_read_tokens / input_tokens; None when no prompt tokens were seen.
+    #[serde(default)]
+    pub cache_hit_rate: Option<f64>,
+    #[serde(default)]
+    pub by_model: Vec<ModelDigest>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ModelDigest {
+    pub model: String,
+    pub events: u64,
+    pub total_tokens: u64,
+    pub known_cost_usd: f64,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ProjectUsage {
+    pub project: String,
+    pub events: u64,
+    pub total_tokens: u64,
+    pub known_cost_usd: f64,
+    pub missed_cost_usd: f64,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -49,7 +77,6 @@ pub struct SourceDigest {
     pub known_cost_usd: f64,
     pub missed_tokens: u64,
 }
-
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Report {
     pub generated_at_ms: u64,
@@ -58,6 +85,10 @@ pub struct Report {
     /// Present only when memex has token usage tracking enabled.
     pub usage: Option<UsageDigest>,
     pub usage_note: Option<String>,
+    /// Per-project cost attribution, top 10 by known cost; empty when usage
+    /// tracking is disabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_usage: Vec<ProjectUsage>,
 }
 
 pub fn memex_paths(root: Option<&PathBuf>) -> Result<Paths> {
@@ -78,9 +109,13 @@ pub fn gather(filters: &Filters) -> Result<Report> {
     )?;
     let projects = aggregate_projects(&rows);
 
-    let (usage, usage_note) = match usage_digest(&paths, filters.since_ms) {
-        Ok(digest) => (Some(digest), None),
-        Err(err) => (None, Some(format!("token usage unavailable: {err:#}"))),
+    let (usage, project_usage, usage_note) = match usage_intel(&paths, filters.since_ms) {
+        Ok((digest, per_project)) => (Some(digest), per_project, None),
+        Err(err) => (
+            None,
+            Vec::new(),
+            Some(format!("token usage unavailable: {err:#}")),
+        ),
     };
 
     Ok(Report {
@@ -89,6 +124,7 @@ pub fn gather(filters: &Filters) -> Result<Report> {
         projects,
         usage,
         usage_note,
+        project_usage,
     })
 }
 
@@ -123,7 +159,7 @@ fn aggregate_projects(rows: &[SessionDetailRow]) -> Vec<ProjectStats> {
     projects
 }
 
-fn usage_digest(paths: &Paths, since_ms: Option<u64>) -> Result<UsageDigest> {
+fn usage_intel(paths: &Paths, since_ms: Option<u64>) -> Result<(UsageDigest, Vec<ProjectUsage>)> {
     let config = UserConfig::load(paths)?;
     if !config.token_usage_enabled() {
         anyhow::bail!(
@@ -139,15 +175,53 @@ fn usage_digest(paths: &Paths, since_ms: Option<u64>) -> Result<UsageDigest> {
         since_ms,
         until_ms: None,
         cost_mode: CostMode::Auto,
-        include_events: false,
+        include_events: true,
         cache_path: Some(paths.state.join("usage-cache.sqlite3")),
         memo_ttl_ms: 0,
     };
     let rep: UsageReport = scan_usage(&query)?;
-    Ok(digest_from(&rep))
+    Ok((digest_from(&rep), project_usage_from(&rep.details)))
+}
+
+/// Per-event cost memex actually charged for, from the provider-reported figure.
+/// memex's catalog fallback pricing is not exposed per event, so events without
+/// `source_cost_usd` contribute tokens but no cost here.
+fn event_known_cost_usd(event: &memex::usage::UsageEvent) -> f64 {
+    event
+        .source_cost_usd
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
+        .unwrap_or(0.0)
 }
 
 fn digest_from(rep: &UsageReport) -> UsageDigest {
+    let mut cache_read_tokens = 0u64;
+    let mut input_tokens = 0u64;
+    let mut by_model: BTreeMap<String, ModelDigest> = BTreeMap::new();
+    for event in &rep.details {
+        cache_read_tokens = cache_read_tokens.saturating_add(event.tokens.cache_read);
+        input_tokens = input_tokens
+            .saturating_add(event.tokens.uncached_input)
+            .saturating_add(event.tokens.cache_read)
+            .saturating_add(event.tokens.cache_write);
+        let model = match event.model.as_deref() {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => "unknown".to_string(),
+        };
+        let entry = by_model
+            .entry(model.clone())
+            .or_insert_with(|| ModelDigest {
+                model,
+                events: 0,
+                total_tokens: 0,
+                known_cost_usd: 0.0,
+            });
+        entry.events += 1;
+        entry.total_tokens = entry.total_tokens.saturating_add(event.tokens.total());
+        entry.known_cost_usd += event_known_cost_usd(event);
+    }
+    let mut by_model: Vec<ModelDigest> = by_model.into_values().collect();
+    by_model.sort_by_key(|m| std::cmp::Reverse(m.total_tokens));
+    let cache_hit_rate = (input_tokens > 0).then(|| cache_read_tokens as f64 / input_tokens as f64);
     UsageDigest {
         events: rep.events,
         total_tokens: rep.total_tokens,
@@ -168,7 +242,41 @@ fn digest_from(rep: &UsageReport) -> UsageDigest {
                 missed_tokens: s.cache_waste.missed_tokens,
             })
             .collect(),
+        cache_read_tokens,
+        input_tokens,
+        cache_hit_rate,
+        by_model,
     }
+}
+
+fn project_usage_from(details: &[memex::usage::UsageEvent]) -> Vec<ProjectUsage> {
+    let mut by_project: BTreeMap<String, ProjectUsage> = BTreeMap::new();
+    for event in details {
+        let project = match event.project.as_deref() {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => "unknown".to_string(),
+        };
+        let entry = by_project
+            .entry(project.clone())
+            .or_insert_with(|| ProjectUsage {
+                project,
+                events: 0,
+                total_tokens: 0,
+                known_cost_usd: 0.0,
+                // Per-missed-token cost needs memex's private price catalog
+                // (usage::cache_miss_cost_usd is not public), so attribution
+                // reports 0 rather than a fabricated estimate; the digest-level
+                // figure stays authoritative.
+                missed_cost_usd: 0.0,
+            });
+        entry.events += 1;
+        entry.total_tokens = entry.total_tokens.saturating_add(event.tokens.total());
+        entry.known_cost_usd += event_known_cost_usd(event);
+    }
+    let mut usage: Vec<ProjectUsage> = by_project.into_values().collect();
+    usage.sort_by(|a, b| b.known_cost_usd.total_cmp(&a.known_cost_usd));
+    usage.truncate(10);
+    usage
 }
 
 pub(crate) fn now_ms() -> u64 {
