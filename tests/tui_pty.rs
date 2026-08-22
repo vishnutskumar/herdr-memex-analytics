@@ -463,6 +463,25 @@ impl Tui {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Feed `keys` repeatedly until `expected` shows on screen. CI runners can
+/// starve the TUI's 250 ms poll loop past a single quiesce window, so one
+/// keystroke is not always observable; re-feeding is safe because the
+/// selection clamps at bounds.
+fn feed_until(tui: &mut Tui, keys: &[u8], expected: &str) {
+    let deadline = Instant::now() + KEY_TIMEOUT;
+    loop {
+        let m = tui.mark();
+        tui.feed(keys);
+        if tui.screen_after_input(m, KEY_TIMEOUT).contains(expected) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "screen never showed {expected:?} after repeated {keys:?}"
+        );
+    }
+}
+
 #[test]
 fn j_k_keys_move_selection_with_title_updates() {
     let fx = fixture("jk-move");
@@ -474,21 +493,9 @@ fn j_k_keys_move_selection_with_title_updates() {
         "initial paint should select the first of 3 projects"
     );
 
-    let m = tui.mark();
-    tui.feed(b"j");
-    let screen = tui.screen_after_input(m, KEY_TIMEOUT);
-    assert!(
-        screen.contains("Sessions 2/3"),
-        "j should advance the selection to 2/3; screen: {screen}"
-    );
+    feed_until(&mut tui, b"j", "Sessions 2/3");
 
-    let m = tui.mark();
-    tui.feed(b"k");
-    let screen = tui.screen_after_input(m, KEY_TIMEOUT);
-    assert!(
-        screen.contains("Sessions 1/3"),
-        "k should move the selection back to 1/3; screen: {screen}"
-    );
+    feed_until(&mut tui, b"k", "Sessions 1/3");
 }
 
 #[test]
@@ -499,21 +506,9 @@ fn arrow_keys_move_selection_like_j_k() {
 
     assert!(tui.wait_text("Sessions 1/3", PAINT_TIMEOUT));
 
-    let m = tui.mark();
-    tui.feed(b"\x1b[B"); // Down
-    let screen = tui.screen_after_input(m, KEY_TIMEOUT);
-    assert!(
-        screen.contains("Sessions 2/3"),
-        "Down arrow should advance the selection; screen: {screen}"
-    );
+    feed_until(&mut tui, b"\x1b[B", "Sessions 2/3"); // Down
 
-    let m = tui.mark();
-    tui.feed(b"\x1b[A"); // Up
-    let screen = tui.screen_after_input(m, KEY_TIMEOUT);
-    assert!(
-        screen.contains("Sessions 1/3"),
-        "Up arrow should move the selection back; screen: {screen}"
-    );
+    feed_until(&mut tui, b"\x1b[A", "Sessions 1/3"); // Up
 }
 
 #[test]

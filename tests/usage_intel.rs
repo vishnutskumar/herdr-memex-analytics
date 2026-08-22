@@ -375,7 +375,7 @@ fn heatmap_is_seven_by_24_and_buckets_tokens_by_hour() {
     // Two events today in distinct hours when possible; the expected cells
     // are derived from the placement, not hardcoded clock times.
     let ts1 = midnight + hour as u64 * 3_600_000 + 5_000;
-    let h2 = if hour >= 8 { hour - 7 } else { hour };
+    let h2 = if hour >= 8 { hour - 7 } else { hour + 10 };
     let ts2 = midnight + h2 as u64 * 3_600_000 + 35_000;
     seed_db(&fx.root, &[]);
     let env = seed_claude(
