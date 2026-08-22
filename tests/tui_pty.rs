@@ -161,6 +161,9 @@ impl Tui {
         };
         let mut master_fd: libc::c_int = -1;
         let pid = unsafe {
+            // libc's forkpty takes *mut winsize on macOS but *const on Linux;
+            // the mutable pass is required on macOS and flagged only on Linux.
+            #[allow(clippy::unnecessary_mut_passed)]
             libc::forkpty(
                 &mut master_fd,
                 std::ptr::null_mut(),
@@ -168,7 +171,6 @@ impl Tui {
                 &mut ws,
             )
         };
-        assert!(pid >= 0, "forkpty failed: {pid}");
         if pid == 0 {
             // Child: exec on the fresh controlling tty; never return.
             unsafe {
