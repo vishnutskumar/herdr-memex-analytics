@@ -37,16 +37,36 @@ pub struct Config {
     /// Daemon cadence in seconds; mirrors memex's periodic reindex model.
     #[serde(default = "default_scan_interval")]
     pub scan_interval_secs: u64,
+    /// Daily spend alert threshold in USD; None disables budget alerts.
+    #[serde(default)]
+    pub daily_cost_usd: Option<f64>,
+    /// Urgent burn-rate alert threshold in USD per trailing hour.
+    #[serde(default = "default_block_burn_rate_usd_hr")]
+    pub block_burn_rate_usd_hr: f64,
+    /// Uncached prompt size at which a session counts as context-bloated.
+    #[serde(default = "default_context_bloat_tokens")]
+    pub context_bloat_tokens: u64,
 }
 
 fn default_scan_interval() -> u64 {
     900
 }
 
+fn default_block_burn_rate_usd_hr() -> f64 {
+    15.0
+}
+
+fn default_context_bloat_tokens() -> u64 {
+    100_000
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             scan_interval_secs: default_scan_interval(),
+            daily_cost_usd: None,
+            block_burn_rate_usd_hr: default_block_burn_rate_usd_hr(),
+            context_bloat_tokens: default_context_bloat_tokens(),
         }
     }
 }
@@ -127,9 +147,18 @@ mod tests {
             usage: None,
             usage_note: Some("disabled".into()),
             project_usage: vec![],
+            daily: vec![],
+            activity_heatmap: vec![],
+            burn_rate_usd_per_hr: None,
+            today_cost_usd: None,
+            reasoning_tokens: 0,
+            reasoning_share: None,
+            bloating_sessions: vec![],
+            wow: None,
+            turns: None,
+            fleet: None,
         }
     }
-
     #[test]
     fn missing_config_file_falls_back_to_defaults() {
         let paths = PluginPaths {

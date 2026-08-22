@@ -1,6 +1,6 @@
 ---
 name: analytics-report
-description: Answer questions about agent usage efficiency using memex-backed analytics — token spend, prompt-cache waste, session counts, active hours per project, and completed-turn durations. Use when the user asks how much they spent on tokens, which projects consume the most agent time, why costs are high, what cache waste means for them, or wants an efficiency report for a date range or project.
+description: Answer questions about agent usage efficiency using memex-backed analytics — token spend, prompt-cache waste, budget pace, fleet status, activity patterns, session counts, active hours per project, and completed-turn durations. Use when the user asks how much they spent on tokens, whether they are over budget, if agents are stuck right now, whether work is being redone, when agent activity peaks, which projects consume the most agent time, why costs are high, what cache waste means for them, or wants an efficiency report for a date range or project.
 allowed-tools: Bash(analytics:*), Bash(memex:*)
 ---
 
@@ -34,6 +34,10 @@ token usage and cache-waste analysis.
 6. **Turn durations come from herdr events**, not memex: `turns.jsonl` in the
    plugin state dir holds one line per completed working segment. Read it
    directly for "how long are my agent turns" questions.
+7. **`fleet` is daemon-only.** Only the background daemon samples herdr for
+   the working/blocked/idle counts; a manual rescan (`analytics snapshot`,
+   `--since`) drops it. For current fleet numbers read `snapshot.json` from
+   the state dir or wait for the next daemon cycle.
 
 ## Step 0: Classify the Question
 
@@ -47,8 +51,11 @@ token usage and cache-waste analysis.
 | "efficiency this week" | `report --since 7d --json` |
 | "am I using the cache well" | `usage`: compare `missed_tokens` against total input; high `idle_misses` = fragmented sessions |
 | "is my cache working" | `usage.cache_hit_rate` = `cache_read_tokens / input_tokens`, where the denominator (`input_tokens`) is uncached input + cache read + cache write; pair with `missed_tokens`/`idle_misses` |
-| "how long are agent turns" | read `$HERDR_PLUGIN_STATE_DIR/turns.jsonl` (default `~/.herdr-memex-analytics/turns.jsonl`), summarize `duration_ms` |
-| "is anything stuck right now" | read `agent-states.json` in the state dir; status `blocked` with old `since_ms` |
+| "how long are agent turns" | read `$HERDR_PLUGIN_STATE_DIR/turns.jsonl` (default `~/.herdr-memex-analytics/turns.jsonl`), summarize `duration_ms`; or `report --json` → `turns` (p50/p95/intervention rate) |
+| "is anything stuck right now" | read `agent-states.json` in the state dir; status `blocked` with old `since_ms`. For a fleet-wide count read `fleet` from the daemon's `snapshot.json`: `working`/`blocked`/`idle` counts |
+| "am I over budget" / budget questions | `report --json` → `today_cost_usd` and `burn_rate_usd_per_hr` (source-reported spend today and in the trailing hour); limits live in state-dir `config.toml` (`daily_cost_usd`, `block_burn_rate_usd_hr`, default 15.0/hr); the daemon alerts when either is exceeded |
+| "am I redoing work" / rework | `report --json` → `turns.rework_turns` (turns under 5 min starting within 10 min after a blocked-ended turn in the same pane) and `turns.intervention_rate`; pair with `turns.human_latency_p50_ms` to show unblock wait |
+| "when do I use agents most" / activity patterns | `report --json` → `activity_heatmap` (7 rows = last 7 local days oldest→newest × 24 hour columns of token sums) and `daily` (per-day tokens/cost/events/sessions) |
 
 ## Output Guidance
 

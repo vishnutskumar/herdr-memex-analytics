@@ -1033,3 +1033,280 @@ fn usage_disabled_leaves_usage_none_and_omits_new_sections() {
     assert!(!text.contains("cache hit-rate"), "{text}");
     assert!(!text.contains("model"), "no model table either: {text}");
 }
+
+// ---------------------------------------------------------------- quality metrics
+
+fn output_match(fx: &Fixture, socket: &str, pane: &str) -> Output {
+    event_raw(
+        fx,
+        socket,
+        &format!(
+            r#"{{"type":"pane.output_matched","data":{{"pane_id":"{pane}","matched_line":"retrying"}}}}"#
+        ),
+    )
+}
+
+#[test]
+fn ended_by_records_what_closed_each_turn() {
+    let fx = fixture("ended-by");
+    event(&fx, "sock-ended", "w1:p1", "working");
+    event(&fx, "sock-ended", "w1:p1", "idle");
+    event(&fx, "sock-ended", "w1:p2", "working");
+    event(&fx, "sock-ended", "w1:p2", "blocked");
+    event(&fx, "sock-ended", "w1:p3", "working");
+    event(&fx, "sock-ended", "w1:p3", "done");
+
+    let turns = std::fs::read_to_string(fx.state_dir.join("turns.jsonl")).unwrap();
+    let ended_by: Vec<String> = turns
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["ended_by"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(ended_by, vec!["idle", "blocked", "done"], "{turns}");
+}
+
+#[test]
+fn gap_recorded_when_blocked_pane_resumes_work() {
+    let fx = fixture("gap");
+    let before = now_ms();
+    event(&fx, "sock-gap", "w1:p1", "working");
+    event(&fx, "sock-gap", "w1:p1", "blocked");
+    let block_window_end = now_ms();
+    std::thread::sleep(Duration::from_millis(5));
+    event(&fx, "sock-gap", "w1:p1", "working");
+    let after = now_ms();
+
+    let gaps = std::fs::read_to_string(fx.state_dir.join("gaps.jsonl")).unwrap();
+    let lines: Vec<&str> = gaps.lines().collect();
+    assert_eq!(lines.len(), 1, "one blocked->working gap: {gaps}");
+    let gap: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(gap["pane_id"], "w1:p1");
+    let started = gap["started_at_ms"].as_u64().unwrap();
+    let duration = gap["duration_ms"].as_u64().unwrap();
+    assert!(
+        started >= before && started <= block_window_end,
+        "gap starts when the pane blocked ({before}..{block_window_end}): {gap}"
+    );
+    assert!(
+        duration > 0 && started + duration <= after,
+        "gap spans exactly the blocked stay: {gap}"
+    );
+}
+
+#[test]
+fn no_gap_recorded_without_a_blocked_stay() {
+    let fx = fixture("no-gap");
+    event(&fx, "sock-nogap", "w1:p1", "working");
+    event(&fx, "sock-nogap", "w1:p1", "idle");
+    event(&fx, "sock-nogap", "w1:p1", "working");
+    assert!(!fx.state_dir.join("gaps.jsonl").exists());
+}
+
+#[test]
+fn loop_alerts_increment_then_reset_after_ten_quiet_minutes() {
+    let fx = fixture("loop-alerts");
+    output_match(&fx, "sock-loop", "w1:p1");
+    output_match(&fx, "sock-loop", "w1:p1");
+    output_match(&fx, "sock-loop", "w1:p2");
+    let alerts: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fx.state_dir.join("loop-alerts.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(alerts["w1:p1"]["count"], 2, "{alerts}");
+    assert_eq!(alerts["w1:p2"]["count"], 1);
+    assert!(
+        alerts["w1:p1"]["first_at_ms"].is_u64() && alerts["w1:p1"]["last_at_ms"].is_u64(),
+        "streak bounds recorded: {alerts}"
+    );
+
+    // A pane silent for over 10 minutes starts its streak over.
+    let now = now_ms();
+    let stale = serde_json::json!({
+        "w9:p9": {"count": 7, "first_at_ms": now - 20 * 60_000, "last_at_ms": now - 11 * 60_000}
+    });
+    std::fs::write(
+        fx.state_dir.join("loop-alerts.json"),
+        serde_json::to_vec(&stale).unwrap(),
+    )
+    .unwrap();
+    output_match(&fx, "sock-loop", "w9:p9");
+    let alerts: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fx.state_dir.join("loop-alerts.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(alerts["w9:p9"]["count"], 1, "stale streak reset: {alerts}");
+    assert_eq!(
+        alerts["w9:p9"]["first_at_ms"],
+        alerts["w9:p9"]["last_at_ms"]
+    );
+}
+
+/// Seed state_dir/turns.jsonl + gaps.jsonl with controlled durations and read
+/// the aggregate back out of `report --json`.
+fn seeded_turn_report_json(
+    fx: &Fixture,
+    turns: &[serde_json::Value],
+    gaps: &[serde_json::Value],
+) -> serde_json::Value {
+    seed_db(fx.root.as_path(), &standard_rows(now_ms()));
+    use std::io::Write as _;
+    for (name, records) in [("turns.jsonl", turns), ("gaps.jsonl", gaps)] {
+        if records.is_empty() {
+            continue;
+        }
+        let mut f = std::fs::File::create(fx.state_dir.join(name)).unwrap();
+        for r in records {
+            serde_json::to_writer(&mut f, r).unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+    }
+    let out = run(fx, &["report", "--all", "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    serde_json::from_str(&stdout(&out)).unwrap()
+}
+
+fn turn_line(
+    pane: &str,
+    agent: &str,
+    finished: u64,
+    duration: u64,
+    ended_by: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "pane_id": pane, "agent": agent,
+        "finished_at_ms": finished, "duration_ms": duration, "ended_by": ended_by
+    })
+}
+
+#[test]
+fn report_exposes_nearest_rank_percentiles_and_rates_from_seeded_logs() {
+    let fx = fixture("turn-stats");
+    // Durations 10k..100k step 10k: nearest-rank p50 of 10 is the 5th, p95 the 10th.
+    let turns: Vec<serde_json::Value> = (1..=10)
+        .map(|i| {
+            turn_line(
+                "p",
+                "claude",
+                i * 1000,
+                i * 10_000,
+                if i == 3 { "blocked" } else { "idle" },
+            )
+        })
+        .collect();
+    let rep = seeded_turn_report_json(
+        &fx,
+        &turns,
+        &[
+            serde_json::json!({"pane_id":"p","agent":"claude","started_at_ms":0,"duration_ms":300_000}),
+        ],
+    );
+    let ts = &rep["turns"];
+    assert!(ts.is_object(), "seeded logs produce turn stats: {rep}");
+    assert_eq!(ts["completed"], 10);
+    assert_eq!(ts["p50_ms"], 50_000);
+    assert_eq!(ts["p95_ms"], 100_000);
+    assert_eq!(ts["by_agent"][0]["agent"], "claude");
+    assert_eq!(ts["by_agent"][0]["completed"], 10);
+    assert_eq!(ts["intervention_rate"], 0.1);
+    assert_eq!(ts["zero_intervention_rate"], 0.9);
+    assert_eq!(ts["human_latency_p50_ms"], 300_000);
+    assert_eq!(ts["human_latency_total_ms"], 300_000);
+}
+
+#[test]
+fn rework_counts_short_turns_after_blocked_in_same_pane_only() {
+    let fx = fixture("rework");
+    let rep = seeded_turn_report_json(
+        &fx,
+        &[
+            // Blocked turn ends at 100_000 on pane p1.
+            turn_line("p1", "claude", 100_000, 80_000, "blocked"),
+            // Starts 30s later, lasts 2min: rework.
+            turn_line("p1", "claude", 220_000, 120_000, "idle"),
+            // Starts 20min after the block: outside the window.
+            turn_line("p1", "claude", 1_400_000, 120_000, "idle"),
+            // Short but nothing blocked on its own pane.
+            turn_line("p2", "claude", 150_000, 60_000, "idle"),
+            // Same window but long: not rework.
+            turn_line("p1", "claude", 400_000, 600_000, "idle"),
+        ],
+        &[],
+    );
+    assert_eq!(rep["turns"]["rework_turns"], 1, "{}", rep);
+}
+
+#[test]
+fn legacy_turn_line_without_ended_by_parses_as_plain_completion() {
+    let fx = fixture("legacy-turn");
+    let rep = seeded_turn_report_json(
+        &fx,
+        &[serde_json::json!({
+            "pane_id": "p1", "agent": "claude",
+            "finished_at_ms": 5_000, "duration_ms": 5_000
+        })],
+        &[],
+    );
+    assert_eq!(rep["turns"]["completed"], 1);
+    assert_eq!(
+        rep["turns"]["intervention_rate"], 0.0,
+        "old lines are not interventions"
+    );
+}
+
+#[test]
+fn report_without_any_logs_leaves_turns_absent() {
+    let fx = fixture("no-turns");
+    seed_db(&fx.root, &standard_rows(now_ms()));
+    let out = run(&fx, &["report", "--all", "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let rep: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(rep["turns"].is_null());
+}
+
+#[test]
+fn watch_rotation_drops_stale_log_records_and_keeps_recent() {
+    let fx = fixture("rotate");
+    seed_db(&fx.root, &standard_rows(now_ms()));
+    let now = now_ms();
+    let retention = 90 * 24 * 3600 * 1000u64;
+    use std::io::Write as _;
+    let mut f = std::fs::File::create(fx.state_dir.join("turns.jsonl")).unwrap();
+    serde_json::to_writer(
+        &mut f,
+        &serde_json::json!({
+            "pane_id":"p","finished_at_ms": now - retention - 3_600_000, "duration_ms": 1
+        }),
+    )
+    .unwrap();
+    f.write_all(b"\n").unwrap();
+    serde_json::to_writer(
+        &mut f,
+        &serde_json::json!({
+            "pane_id":"p","finished_at_ms": now, "duration_ms": 2
+        }),
+    )
+    .unwrap();
+    f.write_all(b"\n").unwrap();
+    drop(f);
+
+    let mut child = spawn_watch(&fx);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut rotated = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(content) = std::fs::read_to_string(fx.state_dir.join("turns.jsonl")) {
+            let lines: Vec<&str> = content.lines().collect();
+            if lines.len() == 1 && content.contains("\"duration_ms\":2") {
+                rotated = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    child.kill().ok();
+    child.wait().ok();
+    assert!(rotated, "daemon rotated stale turn records");
+}

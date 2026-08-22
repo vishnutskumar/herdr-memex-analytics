@@ -10,7 +10,7 @@
 # The version here must match Cargo.toml.
 id = "vishnutskumar.memex-analytics"
 name = "memex-analytics"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.7.0"
 platforms = ["macos", "linux"]
 description = "Session efficiency analytics and realtime guidance for herdr, backed by memex history."
@@ -55,3 +55,16 @@ command = ["bash", "herdr/plugin.sh", "event-hook"]
 # reports failure. Cadence comes from $HERDR_PLUGIN_STATE_DIR/config.toml.
 [[startup]]
 command = ["bash", "herdr/plugin.sh", "startup"]
+
+# The hook also watches for output matches in panes (e.g. retry loops): the
+# daemon folds repeated matches into an urgent "retry loop suspected" tip.
+[[events]]
+on = "pane.output_matched"
+command = ["bash", "herdr/plugin.sh", "event-hook"]
+
+# Older herdr builds emit the raw output-changed event instead of
+# pane.output_matched; subscribing both keeps retry-loop detection working
+# across versions. The hook keys off payload shape, not the event name.
+[[events]]
+on = "pane.output_changed"
+command = ["bash", "herdr/plugin.sh", "event-hook"]

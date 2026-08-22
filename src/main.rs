@@ -1,5 +1,6 @@
 mod agents;
 mod config;
+mod live;
 mod notify;
 mod render;
 mod report;
@@ -99,8 +100,8 @@ fn run() -> Result<()> {
         root: cli.root.clone(),
         since_ms,
         project,
+        memo_ttl_ms: 0,
     };
-
     match cli.cmd {
         Cmd::Report {
             since,
@@ -132,7 +133,7 @@ fn run() -> Result<()> {
         } => {
             let since_ms = parse_since(since.as_deref(), all)?;
             let filters = filters(since_ms, project);
-            let rep = report::gather(&filters)?;
+            let rep = report::gather(&filters, Some(&paths))?;
             config::write_snapshot(&paths, &rep)?;
             eprintln!(
                 "snapshot written to {}",
@@ -163,12 +164,27 @@ fn run() -> Result<()> {
 }
 
 /// Record one agent status transition and act on it: notify immediately on
-/// blocked, log completed turn durations for later efficiency analysis.
+/// blocked, log completed turn durations and human-response gaps for later
+/// efficiency analysis. Output matches feed the retry-loop detector instead.
 fn event_hook(paths: &PluginPaths, raw: &str) -> Result<()> {
     let ev: serde_json::Value =
         serde_json::from_str(raw).with_context(|| format!("bad event JSON {raw:?}"))?;
     // herdr delivers events as an envelope ({type, data}); accept both shapes.
     let body = ev.get("data").unwrap_or(&ev);
+
+    let is_output_match = ev["type"]
+        .as_str()
+        .is_some_and(|t| t.ends_with("output_matched"))
+        || ev["event"]
+            .as_str()
+            .is_some_and(|t| t.ends_with("output_matched"))
+        || body.get("matched_line").is_some();
+    if is_output_match {
+        let pane_id = body["pane_id"].as_str().context("event missing pane_id")?;
+        record_loop_alert(paths, pane_id);
+        return Ok(());
+    }
+
     let status = body["agent_status"]
         .as_str()
         .unwrap_or("unknown")
@@ -198,25 +214,66 @@ fn event_hook(paths: &PluginPaths, raw: &str) -> Result<()> {
     if let Some(duration_ms) = result.completed_turn_ms {
         append_turn(paths, &transition, duration_ms)?;
     }
+    if let Some(duration_ms) = result.resumed_from_blocked_ms {
+        append_gap(
+            paths,
+            &transition,
+            transition.at_ms - duration_ms,
+            duration_ms,
+        )?;
+    }
     Ok(())
 }
 
-/// Completed-turn log (JSONL): one line per working->idle/done transition.
+/// Count a repeated-output match toward the pane's retry-loop streak. The hook
+/// only maintains the ledger; the daemon decides when it becomes a tip.
+fn record_loop_alert(paths: &PluginPaths, pane_id: &str) {
+    let mut alerts = watch::load_loop_alerts(paths);
+    agents::record_output_match(&mut alerts, pane_id, report::now_ms());
+    watch::store_loop_alerts(paths, &alerts).ok();
+}
+
+/// Completed-turn log (JSONL): one line per closed working segment. `ended_by`
+/// distinguishes real completions from blocked interruptions.
 fn append_turn(paths: &PluginPaths, t: &agents::Transition, duration_ms: u64) -> Result<()> {
-    fs::create_dir_all(&paths.state_dir)?;
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(paths.state_dir.join("turns.jsonl"))?;
-    serde_json::to_writer(
-        &mut f,
+    append_jsonl(
+        paths.state_dir.join("turns.jsonl"),
         &serde_json::json!({
             "pane_id": t.pane_id,
             "agent": t.agent,
             "finished_at_ms": t.at_ms,
             "duration_ms": duration_ms,
+            "ended_by": t.status,
         }),
-    )?;
+    )
+}
+
+/// Human-response gap (JSONL): how long a blocked pane waited before working
+/// again.
+fn append_gap(
+    paths: &PluginPaths,
+    t: &agents::Transition,
+    started_at_ms: u64,
+    duration_ms: u64,
+) -> Result<()> {
+    append_jsonl(
+        paths.state_dir.join("gaps.jsonl"),
+        &serde_json::json!({
+            "pane_id": t.pane_id,
+            "agent": t.agent,
+            "started_at_ms": started_at_ms,
+            "duration_ms": duration_ms,
+        }),
+    )
+}
+
+fn append_jsonl(path: PathBuf, value: &serde_json::Value) -> Result<()> {
+    fs::create_dir_all(path.parent().context("log path has no parent")?)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    serde_json::to_writer(&mut f, value)?;
     f.write_all(b"\n")?;
     Ok(())
 }

@@ -30,6 +30,16 @@ pub(crate) fn load_report_shared(filters: &Filters, paths: &PluginPaths) -> Repo
         usage: None,
         usage_note: Some(format!("scan failed: {err:#}")),
         project_usage: vec![],
+        daily: vec![],
+        activity_heatmap: vec![],
+        burn_rate_usd_per_hr: None,
+        today_cost_usd: None,
+        reasoning_tokens: 0,
+        reasoning_share: None,
+        bloating_sessions: vec![],
+        wow: None,
+        turns: None,
+        fleet: None,
     })
 }
 
@@ -41,7 +51,7 @@ fn load_report(filters: &Filters, paths: &PluginPaths) -> Result<report::Report>
     {
         return Ok(snap);
     }
-    report::gather(filters)
+    report::gather(filters, Some(paths))
 }
 
 fn render_text(rep: &Report, live: &crate::tips::Tips) -> String {
@@ -163,6 +173,14 @@ fn render_text(rep: &Report, live: &crate::tips::Tips) -> String {
         }
         (None, None) => {}
     }
+    let activity = activity_lines(rep);
+    if !activity.is_empty() {
+        out.push_str("\nActivity\n");
+        for line in activity {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
     out
 }
 
@@ -196,11 +214,124 @@ pub(crate) fn human_tokens(n: u64) -> String {
     }
 }
 
+/// Seven-level cost sparkline over a value series; flat baseline when every
+/// value is zero.
+pub(crate) fn sparkline(values: &[f64]) -> String {
+    const RAMP: [char; 7] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇'];
+    let max = values.iter().cloned().fold(0.0_f64, f64::max);
+    if max <= 0.0 {
+        return "\u{2581}".repeat(values.len());
+    }
+    values
+        .iter()
+        .map(|v| {
+            let idx = (((v / max) * 6.0).round() as usize).min(6);
+            RAMP[idx]
+        })
+        .collect()
+}
+
+/// Compact duration: `45s`, `3m12s`, `2h05m`, `1d03h`.
+pub(crate) fn human_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m{}s", secs / 60, secs % 60),
+        3600..=86_399 => format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60),
+        _ => format!("{}d{:02}h", secs / 86_400, (secs % 86_400) / 3_600),
+    }
+}
+
+/// Sign-aware dollar delta: `+$1.20` / `-$3.40`.
+pub(crate) fn signed_usd(v: f64) -> String {
+    if v >= 0.0 {
+        format!("+${v:.2}")
+    } else {
+        format!("-${:.2}", -v)
+    }
+}
+
+/// The `Activity` block: daily-cost sparkline, spend pace, week-over-week
+/// delta, turn quality, fleet status, and bloat warnings. Every line stays
+/// within 100 columns.
+fn activity_lines(rep: &Report) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !rep.daily.is_empty() {
+        let costs: Vec<f64> = rep.daily.iter().map(|d| d.cost_usd).collect();
+        let total: f64 = costs.iter().sum();
+        lines.push(format!(
+            "  daily cost  {}  ${:.2}/{}d",
+            sparkline(&costs),
+            total,
+            costs.len()
+        ));
+    }
+    let mut spend = Vec::new();
+    if let Some(burn) = rep.burn_rate_usd_per_hr {
+        spend.push(format!("burn ${burn:.2}/hr"));
+    }
+    if let Some(today) = rep.today_cost_usd {
+        spend.push(format!("today ${today:.2}"));
+    }
+    if !spend.is_empty() {
+        lines.push(format!("  spend  {}", spend.join(" · ")));
+    }
+    if let (Some(usage), Some(wow)) = (&rep.usage, &rep.wow) {
+        let delta = usage.known_cost_usd - wow.cost_usd;
+        let pct = if wow.cost_usd > 0.0 {
+            format!(" ({:+.1}%)", delta / wow.cost_usd * 100.0)
+        } else {
+            String::new()
+        };
+        lines.push(format!("  vs prior window  {}{pct}", signed_usd(delta)));
+    }
+    if let Some(t) = &rep.turns {
+        let ir = t
+            .intervention_rate
+            .map(|r| format!(" · interventions {:.0}%", r * 100.0))
+            .unwrap_or_default();
+        lines.push(format!(
+            "  turns {} completed · p50 {} · p95 {}{ir}",
+            t.completed,
+            t.p50_ms.map_or_else(|| "n/a".into(), human_ms),
+            t.p95_ms.map_or_else(|| "n/a".into(), human_ms),
+        ));
+        if let Some(hl) = t.human_latency_p50_ms {
+            lines.push(format!("  human unblock p50 {}", human_ms(hl)));
+        }
+    }
+    if let Some(fleet) = &rep.fleet {
+        lines.push(format!(
+            "  fleet  {} working · {} blocked · {} idle",
+            fleet.working, fleet.blocked, fleet.idle
+        ));
+    }
+    if let Some(b) = rep.bloating_sessions.first() {
+        lines.push(format!(
+            "  context bloat: {:.12} ({}) at {} uncached input",
+            b.session_id,
+            b.project,
+            human_tokens(b.last_uncached_input)
+        ));
+    }
+    if rep.reasoning_tokens > 0 {
+        let share = rep
+            .reasoning_share
+            .map(|s| format!(" ({:.1}% of output)", s * 100.0))
+            .unwrap_or_default();
+        lines.push(format!(
+            "  reasoning {} tokens{share}",
+            human_tokens(rep.reasoning_tokens)
+        ));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::PluginPaths;
-    use crate::report::{ProjectStats, SourceDigest, UsageDigest};
+    use crate::report::{BloatSession, DayPoint, ProjectStats, SourceDigest, UsageDigest, Wow};
     use std::collections::BTreeMap;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -256,6 +387,16 @@ mod tests {
             usage: None,
             usage_note: Some("disabled; set token_usage = true in config.toml".into()),
             project_usage: vec![],
+            daily: vec![],
+            activity_heatmap: vec![],
+            burn_rate_usd_per_hr: None,
+            today_cost_usd: None,
+            reasoning_tokens: 0,
+            reasoning_share: None,
+            bloating_sessions: vec![],
+            wow: None,
+            turns: None,
+            fleet: None,
         }
     }
 
@@ -266,6 +407,7 @@ mod tests {
             root: Some(std::path::PathBuf::from("/nonexistent-analytics-test-root")),
             since_ms: None,
             project: None,
+            memo_ttl_ms: 0,
         }
     }
 
@@ -393,5 +535,156 @@ mod tests {
         assert_eq!(human_tokens(25_000), "25.0K");
         assert_eq!(human_tokens(1_500_000), "1.5M");
         assert_eq!(human_tokens(2_000_000_000), "2.0B");
+    }
+
+    #[test]
+    fn sparkline_scales_to_seven_levels_with_flat_zero_baseline() {
+        assert_eq!(sparkline(&[]), "");
+        assert_eq!(sparkline(&[0.0, 0.0]), "▁▁");
+        assert_eq!(sparkline(&[0.0, 5.0]), "▁▇");
+        assert_eq!(sparkline(&[2.5, 5.0, 0.0]), "▄▇▁");
+        // Equal values all hit the top level.
+        assert_eq!(sparkline(&[5.0, 5.0]), "▇▇");
+    }
+
+    #[test]
+    fn human_ms_buckets_through_seconds_days() {
+        assert_eq!(human_ms(45_000), "45s");
+        assert_eq!(human_ms(192_000), "3m12s");
+        assert_eq!(human_ms(7_500_000), "2h05m");
+        assert_eq!(human_ms(97_200_000), "1d03h");
+        assert_eq!(human_ms(900_000), "15m0s");
+        assert_eq!(human_ms(65_000), "1m5s");
+    }
+
+    #[test]
+    fn signed_usd_marks_direction() {
+        assert_eq!(signed_usd(1.2), "+$1.20");
+        assert_eq!(signed_usd(-3.4), "-$3.40");
+        assert_eq!(signed_usd(0.0), "+$0.00");
+    }
+
+    #[test]
+    fn activity_lines_render_wow_turns_fleet_bloat_and_reasoning() {
+        let mut rep = sample_report();
+        rep.usage_note = None;
+        rep.usage = Some(UsageDigest {
+            events: 10,
+            total_tokens: 25_000,
+            known_cost_usd: 11.0,
+            missed_tokens: 0,
+            missed_cost_usd: 0.0,
+            miss_count: 0,
+            idle_misses: 0,
+            model_switch_misses: 0,
+            by_source: vec![],
+            cache_read_tokens: 0,
+            input_tokens: 0,
+            cache_hit_rate: None,
+            by_model: vec![],
+        });
+        rep.daily = vec![DayPoint {
+            date: "2026-08-20".into(),
+            tokens: 10_000,
+            cost_usd: 1.25,
+            events: 4,
+            sessions: 1,
+        }];
+        rep.burn_rate_usd_per_hr = Some(4.5);
+        rep.today_cost_usd = Some(2.0);
+        rep.wow = Some(Wow {
+            cost_usd: 10.0,
+            missed_cost_usd: 0.0,
+        });
+        rep.reasoning_tokens = 4_000;
+        rep.reasoning_share = Some(0.4);
+        rep.bloating_sessions = vec![BloatSession {
+            session_id: "abc123-def456".into(),
+            project: "/w/big".into(),
+            last_uncached_input: 150_000,
+        }];
+        rep.turns = Some(crate::agents::TurnStats {
+            completed: 8,
+            p50_ms: Some(192_000),
+            p95_ms: Some(900_000),
+            by_agent: vec![],
+            intervention_rate: Some(0.125),
+            zero_intervention_rate: Some(0.875),
+            rework_turns: 2,
+            human_latency_p50_ms: Some(65_000),
+            human_latency_total_ms: 600_000,
+        });
+        rep.fleet = Some(crate::live::FleetSnapshot {
+            working: 2,
+            blocked: 1,
+            idle: 3,
+            churn: vec![],
+            sampled_at_ms: report::now_ms(),
+        });
+
+        let lines = activity_lines(&rep);
+        let joined = lines.join("\n");
+        for expected in [
+            "daily cost",
+            "spend  burn $4.50/hr · today $2.00",
+            "vs prior window  +$1.00 (+10.0%)",
+            "turns 8 completed · p50 3m12s · p95 15m0s · interventions 12%",
+            "human unblock p50 1m5s",
+            "fleet  2 working · 1 blocked · 3 idle",
+            "context bloat: abc123-def45 (/w/big) at 150.0K uncached input",
+            "reasoning 4.0K tokens (40.0% of output)",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "missing `{expected}` in:\n{joined}"
+            );
+        }
+        for line in &lines {
+            assert!(
+                line.chars().count() <= 100,
+                "activity line exceeds 100 cols: {line}"
+            );
+        }
+
+        rep.wow = Some(Wow {
+            cost_usd: 12.0,
+            missed_cost_usd: 0.0,
+        });
+        let joined = activity_lines(&rep).join("\n");
+        assert!(
+            joined.contains("vs prior window  -$1.00 (-8.3%)"),
+            "negative WoW must be sign-aware:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn text_report_includes_the_activity_block_when_data_exists() {
+        let paths = tmp_paths("activity");
+        let mut rep = sample_report();
+        rep.usage_note = None;
+        rep.usage = Some(UsageDigest {
+            events: 2,
+            total_tokens: 1_000,
+            known_cost_usd: 0.5,
+            missed_tokens: 0,
+            missed_cost_usd: 0.0,
+            miss_count: 0,
+            idle_misses: 0,
+            model_switch_misses: 0,
+            by_source: vec![],
+            cache_read_tokens: 0,
+            input_tokens: 0,
+            cache_hit_rate: None,
+            by_model: vec![],
+        });
+        rep.wow = Some(Wow {
+            cost_usd: 0.4,
+            missed_cost_usd: 0.0,
+        });
+        seed_snapshot(&paths, rep);
+        let out = render(&nowhere_filters(), &paths, false).unwrap();
+        assert!(out.contains("Activity"), "{out}");
+        assert!(out.contains("vs prior window  +$0.10 (+25.0%)"), "{out}");
+        fs::remove_dir_all(&paths.state_dir).ok();
     }
 }
