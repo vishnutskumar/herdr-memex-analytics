@@ -10,7 +10,7 @@
 # The version here must match Cargo.toml.
 id = "vishnutskumar.memex-analytics"
 name = "memex-analytics"
-version = "0.3.0"
+version = "0.3.1"
 min_herdr_version = "0.7.0"
 platforms = ["macos", "linux"]
 description = "Session efficiency analytics and realtime guidance for herdr, backed by memex history."
@@ -55,16 +55,8 @@ command = ["bash", "herdr/plugin.sh", "event-hook"]
 # reports failure. Cadence comes from $HERDR_PLUGIN_STATE_DIR/config.toml.
 [[startup]]
 command = ["bash", "herdr/plugin.sh", "startup"]
+# Retry-loop detection is owned by the snapshot daemon (config: retry_patterns):
+# herdr's plugin event hooks do not accept pane output events (pane.output_matched
+# and pane.output_changed are rejected at install time), so the daemon polls
+# recognized agent panes on its own cadence instead of declaring [[events]] here.
 
-# The hook also watches for output matches in panes (e.g. retry loops): the
-# daemon folds repeated matches into an urgent "retry loop suspected" tip.
-[[events]]
-on = "pane.output_matched"
-command = ["bash", "herdr/plugin.sh", "event-hook"]
-
-# Older herdr builds emit the raw output-changed event instead of
-# pane.output_matched; subscribing both keeps retry-loop detection working
-# across versions. The hook keys off payload shape, not the event name.
-[[events]]
-on = "pane.output_changed"
-command = ["bash", "herdr/plugin.sh", "event-hook"]

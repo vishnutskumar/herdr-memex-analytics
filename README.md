@@ -36,8 +36,11 @@ churn.
 **Realtime guidance** — a manifest event hook fires on every agent status
 transition. You get a Herdr notification the moment an agent blocks, the daemon
 re-nags if one stays blocked, and long single turns get flagged. Completed-turn
-durations are logged for later analysis. Repeated output matches in a pane
-(retry loops) become an urgent tip, and budget alerts fire when today's spend
+durations are logged for later analysis. Retry-loop detection: when
+`retry_patterns` is configured, the daemon polls recent output of recognized
+agent panes and an urgent tip fires after repeated hits (herdr plugin event
+hooks cannot subscribe to pane-output events, so the daemon owns the
+detection). Budget alerts fire when today's spend
 passes `daily_cost_usd` (once per local day) or the trailing-hour burn rate
 exceeds `block_burn_rate_usd_hr` (at most once per hour).
 
@@ -107,6 +110,9 @@ scan_interval_secs = 900              # daemon rescan cadence
 daily_cost_usd = 20.0                # alert when today's spend passes this (omit to disable)
 block_burn_rate_usd_hr = 15.0        # alert when trailing-hour burn rate exceeds this
 context_bloat_tokens = 100_000       # flag sessions whose uncached prompt grows past this
+retry_patterns = ["retrying", "still failing", "re-trying"]  # retry-loop detection (empty = off)
+retry_scan_interval_ms = 5000        # how often the daemon polls agent pane output for the patterns
+retry_window_lines = 60              # how many recent lines of each pane the poll inspects
 ```
 
 The TUI dashboard (`analytics ui`) adds a braille activity chart over the

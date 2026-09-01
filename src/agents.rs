@@ -336,6 +336,7 @@ pub fn record_output_match(alerts: &mut crate::watch::LoopAlerts, pane_id: &str,
                     count: 1,
                     first_at_ms: now_ms,
                     last_at_ms: now_ms,
+                    last_notified_ms: None,
                 },
             );
         }

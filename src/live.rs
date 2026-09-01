@@ -27,6 +27,38 @@ pub struct FleetSnapshot {
     pub sampled_at_ms: u64,
 }
 
+/// Panes whose occupant herdr recognizes as an agent, mapped to the agent
+/// kind. The retry-loop scan only reads these: ordinary shells and editors
+pub fn agent_panes() -> BTreeMap<String, String> {
+    let Some(value) = raw_snapshot() else {
+        return BTreeMap::new();
+    };
+    let agents = &value["result"]["snapshot"]["agents"];
+    let Ok(agents) = serde_json::from_value::<Vec<RawAgent>>(agents.clone()) else {
+        return BTreeMap::new();
+    };
+    agents
+        .into_iter()
+        .filter(|a| a.agent.is_some())
+        .map(|a| (a.pane_id, a.agent.unwrap()))
+        .collect()
+}
+
+/// `api snapshot` decoded, or None on any failure (missing server, bad
+/// output). Both sample() and agent_panes() share this so a wedged herdr
+/// degrades to "no live data", never a panic.
+fn raw_snapshot() -> Option<serde_json::Value> {
+    let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
+    let out = std::process::Command::new(bin)
+        .args(["api", "snapshot"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
+}
+
 #[derive(Deserialize)]
 struct RawAgent {
     agent: Option<String>,
@@ -55,15 +87,7 @@ fn store_prev_revisions(paths: &PluginPaths, revisions: &BTreeMap<String, u64>) 
 /// live-state.json, and returns None on any failure so the daemon survives a
 /// missing or wedged herdr server.
 pub fn sample(paths: &PluginPaths) -> Option<FleetSnapshot> {
-    let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
-    let out = std::process::Command::new(bin)
-        .args(["api", "snapshot"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let value = raw_snapshot()?;
     let agents = &value["result"]["snapshot"]["agents"];
     if !agents.is_array() {
         return None;

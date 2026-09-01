@@ -551,6 +551,10 @@ fn selection_clamps_at_top_and_bottom_bounds() {
         "selection must clamp at the top bound; screen: {screen}"
     );
 
+    // Drive the selection to the bottom bound first, the way the other
+    // movement tests do: a fixed keystroke batch can be swallowed by the
+    // poll loop, leaving the clamp assertion a timing race.
+    feed_until(&mut tui, b"j", "Sessions 3/3");
     // Hammer j well past the bottom bound; selection must stop at 3/3.
     let m = tui.mark();
     for _ in 0..10 {

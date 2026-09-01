@@ -46,6 +46,17 @@ pub struct Config {
     /// Uncached prompt size at which a session counts as context-bloated.
     #[serde(default = "default_context_bloat_tokens")]
     pub context_bloat_tokens: u64,
+    /// Substrings that count as a retry-loop signal when they appear in a
+    /// recognized agent pane's recent output; empty disables retry-loop tips.
+    #[serde(default)]
+    pub retry_patterns: Vec<String>,
+    /// Milliseconds between retry-loop output scans; must stay far below the
+    /// scan cadence for the ledger's 10-minute window to mean anything.
+    #[serde(default = "default_retry_scan_interval_ms")]
+    pub retry_scan_interval_ms: u64,
+    /// How many recent lines of a pane the retry scan inspects.
+    #[serde(default = "default_retry_window_lines")]
+    pub retry_window_lines: u64,
 }
 
 fn default_scan_interval() -> u64 {
@@ -60,6 +71,14 @@ fn default_context_bloat_tokens() -> u64 {
     100_000
 }
 
+fn default_retry_scan_interval_ms() -> u64 {
+    5_000
+}
+
+fn default_retry_window_lines() -> u64 {
+    60
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -67,6 +86,9 @@ impl Default for Config {
             daily_cost_usd: None,
             block_burn_rate_usd_hr: default_block_burn_rate_usd_hr(),
             context_bloat_tokens: default_context_bloat_tokens(),
+            retry_patterns: Vec::new(),
+            retry_scan_interval_ms: default_retry_scan_interval_ms(),
+            retry_window_lines: default_retry_window_lines(),
         }
     }
 }
