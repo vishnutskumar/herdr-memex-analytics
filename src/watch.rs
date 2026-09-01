@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -10,8 +10,8 @@ use crate::notify;
 use crate::report::{self, Filters, Report};
 use crate::tips;
 
-/// A pane.output_matched hit recorded by the event hook; refresh_tips turns
-/// repeated hits into an urgent retry-loop tip.
+/// A retry-pattern hit recorded by the daemon's output scan; refresh_tips
+/// turns repeated hits into an urgent retry-loop tip.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct LoopAlert {
     #[serde(default)]
@@ -20,6 +20,9 @@ pub struct LoopAlert {
     pub first_at_ms: u64,
     #[serde(default)]
     pub last_at_ms: u64,
+    /// When the urgent tip for this streak last notified; None has never fired.
+    #[serde(default)]
+    pub last_notified_ms: Option<u64>,
 }
 
 /// All panes' output-match streaks, keyed by pane id.
@@ -29,6 +32,9 @@ pub type LoopAlerts = BTreeMap<String, LoopAlert>;
 /// stale and pruned.
 pub const LOOP_WINDOW_MS: u64 = 10 * 60 * 1000;
 const LOOP_TIP_MIN_COUNT: u64 = 3;
+/// Milliseconds between re-notifications of the same retry-loop tip; same
+/// cadence as the blocked nag.
+const RETRY_NAG_MS: u64 = 15 * 60 * 1000;
 /// Revision advance per sample above which a long turn is considered actively
 /// producing output rather than stuck.
 pub const PRODUCING_CHURN_MIN: u64 = 50;
@@ -118,7 +124,16 @@ pub fn evaluate_budget_alerts(
 
 /// Pure: urgent retry-loop tips for panes with enough fresh matches; stale
 /// entries (no match within LOOP_WINDOW_MS) are dropped from the returned map.
-pub fn merge_loop_alerts(alerts: &LoopAlerts, now_ms: u64) -> (Vec<agents::Tip>, LoopAlerts) {
+///
+/// Returns `(tips, notified, kept)`: `tips` is published while the streak
+/// stays fresh (the report pane must keep showing it), while `notified` lists
+/// the panes whose re-notification is due this call (at most once per
+/// RETRY_NAG_MS); their `last_notified_ms` is stamped in `kept` so the caller
+/// can persist it.
+pub fn merge_loop_alerts(
+    alerts: &LoopAlerts,
+    now_ms: u64,
+) -> (Vec<agents::Tip>, Vec<String>, LoopAlerts) {
     let mut kept = BTreeMap::new();
     for (pane, alert) in alerts {
         if now_ms.saturating_sub(alert.last_at_ms) < LOOP_WINDOW_MS {
@@ -126,19 +141,32 @@ pub fn merge_loop_alerts(alerts: &LoopAlerts, now_ms: u64) -> (Vec<agents::Tip>,
         }
     }
     let mut tips = Vec::new();
-    for (pane, alert) in &kept {
-        if alert.count >= LOOP_TIP_MIN_COUNT {
-            tips.push(agents::Tip {
-                pane_id: pane.clone(),
-                message: format!(
-                    "retry loop suspected ({} output matches) — check the pane",
-                    alert.count
-                ),
-                urgent: true,
-            });
+    let mut notified = Vec::new();
+    for (pane, alert) in kept.iter_mut() {
+        if alert.count < LOOP_TIP_MIN_COUNT {
+            continue;
+        }
+        tips.push(agents::Tip {
+            pane_id: pane.clone(),
+            message: format!(
+                "retry loop suspected ({} output matches) — check the pane",
+                alert.count
+            ),
+            urgent: true,
+        });
+        if due_for_loop_nag(alert, now_ms) {
+            notified.push(pane.clone());
+            alert.last_notified_ms = Some(now_ms);
         }
     }
-    (tips, kept)
+    (tips, notified, kept)
+}
+
+fn due_for_loop_nag(alert: &LoopAlert, now_ms: u64) -> bool {
+    match alert.last_notified_ms {
+        None => true,
+        Some(at) => now_ms.saturating_sub(at) >= RETRY_NAG_MS,
+    }
 }
 
 /// Pure: a long-turn tip on a pane whose revision keeps advancing means the
@@ -161,11 +189,39 @@ pub fn suppress_churning_tips(
         .collect()
 }
 
-/// Daemon loop: recompute the snapshot on a fixed cadence, like memex's periodic
-/// reindex, then evaluate realtime tips from the agent states the event hook
-/// maintains. Never exits on a failed cycle; a transient error just skips one
-/// refresh.
-pub fn run(mut filters: Filters, paths: &PluginPaths, interval: Duration) -> Result<()> {
+/// One full daemon cycle: rescan memex, refresh the snapshot, re-evaluate
+/// tips. A failed cycle is logged and skipped; the daemon keeps running.
+fn scan_cycle(filters: &mut Filters, paths: &PluginPaths) {
+    match report::gather(filters, Some(paths)) {
+        Ok(mut rep) => {
+            rep.fleet = live::sample(paths);
+            if let Err(err) = config::write_snapshot(paths, &rep) {
+                eprintln!("analytics watch: snapshot write failed: {err:#}");
+            }
+            refresh_tips(paths, rep.fleet.as_ref(), Some(&rep));
+        }
+        Err(err) => {
+            eprintln!("analytics watch: scan failed: {err:#}");
+            let snap = config::read_snapshot(paths);
+            refresh_tips(paths, None, snap.as_ref());
+        }
+    }
+    agents::rotate_logs(paths, agents::TURN_RETENTION_MS);
+}
+
+/// Daemon loop: recompute the snapshot on a fixed cadence, like memex's
+/// periodic reindex, then evaluate realtime tips from the agent states the
+/// event hook maintains. When `retry_patterns` is configured, recognized
+/// agent panes are additionally polled for retry-loop signals on a much
+/// faster cadence (herdr's plugin event hooks do not expose pane output
+/// events, so the daemon owns that detection). Never exits on a failed
+/// cycle; a transient error just skips one refresh.
+pub fn run(
+    mut filters: Filters,
+    paths: &PluginPaths,
+    interval: Duration,
+    cfg: &Config,
+) -> Result<()> {
     // The daemon rescans every cycle anyway; the memo just bridges the two
     // gathers inside one interval window.
     filters.memo_ttl_ms = interval.as_millis() as u64 * 2;
@@ -174,30 +230,100 @@ pub fn run(mut filters: Filters, paths: &PluginPaths, interval: Duration) -> Res
         interval.as_secs(),
         config::snapshot_path(paths).display()
     );
+    scan_cycle(&mut filters, paths);
+
+    // Retry-loop polling needs a floor: below 1 s the herdr CLI round trip is
+    // the cost, not the signal.
+    let retry_every = if cfg.retry_patterns.is_empty() {
+        None
+    } else {
+        Some(Duration::from_millis(cfg.retry_scan_interval_ms.max(1_000)))
+    };
+    let mut next_scan = Instant::now() + interval;
+    let mut next_retry = retry_every.map(|d| Instant::now() + d);
     loop {
-        match report::gather(&filters, Some(paths)) {
-            Ok(mut rep) => {
-                rep.fleet = live::sample(paths);
-                if let Err(err) = config::write_snapshot(paths, &rep) {
-                    eprintln!("analytics watch: snapshot write failed: {err:#}");
-                }
-                refresh_tips(paths, rep.fleet.as_ref(), Some(&rep));
-            }
-            Err(err) => {
-                eprintln!("analytics watch: scan failed: {err:#}");
-                let snap = config::read_snapshot(paths);
-                refresh_tips(paths, None, snap.as_ref());
-            }
+        // Wake at the earlier of the two due times (scan always has one).
+        let wake = next_retry.map_or(next_scan, |r| r.min(next_scan));
+        if wake > Instant::now() {
+            std::thread::sleep(wake - Instant::now());
         }
-        agents::rotate_logs(paths, agents::TURN_RETENTION_MS);
-        std::thread::sleep(interval);
+        let now = Instant::now();
+        if next_retry.is_some_and(|r| r <= now)
+            && let Some(retry) = retry_every
+        {
+            let hits = scan_live_output(paths, cfg);
+            if let Err(err) = store_loop_alerts(paths, &hits) {
+                eprintln!("analytics watch: loop-alerts write failed: {err:#}");
+            }
+            let snap = config::read_snapshot(paths);
+            refresh_tips(paths, None, snap.as_ref());
+            next_retry = Some(now + retry);
+        }
+        if next_scan <= now {
+            scan_cycle(&mut filters, paths);
+            next_scan = now + interval;
+        }
     }
+}
+
+/// Scan recent output of every recognized agent pane for retry patterns and
+/// return the updated ledger. Panes without a recognized agent are skipped —
+/// ordinary shells would false-positive. A pane with no match this cycle
+/// keeps its streak untouched; the 10-minute window prunes it later.
+fn scan_live_output(paths: &PluginPaths, cfg: &Config) -> LoopAlerts {
+    let panes = live::agent_panes();
+    if panes.is_empty() {
+        return load_loop_alerts(paths);
+    }
+    let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
+    let mut alerts = load_loop_alerts(paths);
+    let now = report::now_ms();
+    for pane in panes.keys() {
+        let Some(text) = read_recent_output(&bin, pane, cfg.retry_window_lines) else {
+            continue;
+        };
+        let hits = count_hits(&text, &cfg.retry_patterns);
+        for _ in 0..hits {
+            agents::record_output_match(&mut alerts, pane, now);
+        }
+    }
+    alerts
+}
+
+/// One `pane read` of recent output; any failure is a skipped pane, never an
+/// aborted scan.
+fn read_recent_output(bin: &str, pane: &str, lines: u64) -> Option<String> {
+    let out = std::process::Command::new(bin)
+        .args([
+            "pane",
+            "read",
+            pane,
+            "--source",
+            "recent",
+            "--lines",
+            &lines.to_string(),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// At most one hit per pattern per read, so a pattern repeated across the
+/// whole window still counts once per scan cycle.
+fn count_hits(text: &str, patterns: &[String]) -> u64 {
+    patterns
+        .iter()
+        .filter(|p| text.contains(p.as_str()))
+        .count() as u64
 }
 
 /// Evaluate tips across every herdr session's state, notify the urgent ones
 /// (rate limited by last_notified_ms), and publish the full list for the
-/// report pane. Also folds in retry-loop alerts from the event hook and
-/// budget alerts from the latest report numbers.
+/// report pane. Also folds in retry-loop alerts from the daemon's output scan
+/// and budget alerts from the latest report numbers.
 fn refresh_tips(paths: &PluginPaths, fleet: Option<&FleetSnapshot>, rep: Option<&Report>) {
     let now = report::now_ms();
     let mut due: Vec<agents::Tip> = Vec::new();
@@ -233,15 +359,21 @@ fn refresh_tips(paths: &PluginPaths, fleet: Option<&FleetSnapshot>, rep: Option<
     }
 
     let loaded = load_loop_alerts(paths);
-    let (loop_tips, pruned) = merge_loop_alerts(&loaded, now);
-    if pruned.len() != loaded.len()
-        && let Err(err) = store_loop_alerts(paths, &pruned)
-    {
+    let (loop_tips, loop_notified, pruned) = merge_loop_alerts(&loaded, now);
+    // Persist when entries were pruned or a nag fired: merge_loop_alerts
+    // stamps last_notified_ms, which must survive the in-window period or
+    // the urgent tip re-notifies every poll cycle.
+    let ledger_changed = pruned.len() != loaded.len() || !loop_notified.is_empty();
+    if ledger_changed && let Err(err) = store_loop_alerts(paths, &pruned) {
         eprintln!("analytics watch: loop-alerts write failed: {err:#}");
     }
-    for tip in loop_tips {
-        notify::show(paths, &tip.message);
-        due.push(tip);
+    // The tip is published while the streak is fresh (the report pane keeps
+    // showing it); the herdr notification is rate limited per pane.
+    for tip in &loop_tips {
+        if loop_notified.contains(&tip.pane_id) {
+            notify::show(paths, &tip.message);
+        }
+        due.push(tip.clone());
     }
 
     let cfg = Config::load(paths);
@@ -281,10 +413,9 @@ mod tests {
 
     fn cfg(daily: Option<f64>, burn: f64) -> Config {
         Config {
-            scan_interval_secs: 900,
             daily_cost_usd: daily,
             block_burn_rate_usd_hr: burn,
-            context_bloat_tokens: 100_000,
+            ..Default::default()
         }
     }
 
@@ -389,6 +520,7 @@ mod tests {
                 count: 3,
                 first_at_ms: 0,
                 last_at_ms: 1_000,
+                last_notified_ms: None,
             },
         );
         alerts.insert(
@@ -397,6 +529,7 @@ mod tests {
                 count: 2,
                 first_at_ms: 0,
                 last_at_ms: 1_000,
+                last_notified_ms: None,
             },
         );
         alerts.insert(
@@ -405,17 +538,57 @@ mod tests {
                 count: 9,
                 first_at_ms: 0,
                 last_at_ms: 0,
+                last_notified_ms: None,
             },
         );
         let now = LOOP_WINDOW_MS + 500;
-        let (tips, kept) = merge_loop_alerts(&alerts, now);
+        let (tips, notified, kept) = merge_loop_alerts(&alerts, now);
         assert_eq!(tips.len(), 1);
         assert_eq!(tips[0].pane_id, "w1:p1");
         assert!(tips[0].urgent);
         assert!(tips[0].message.contains("retry loop"));
+        // First sighting of a fresh streak notifies immediately.
+        assert_eq!(notified, vec!["w1:p1".to_string()]);
+        assert_eq!(kept.get("w1:p1").unwrap().last_notified_ms, Some(now));
         // Stale entry pruned; fresh but infrequent entry kept without a tip.
         assert!(!kept.contains_key("old:p3"));
         assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn loop_alerts_tip_stays_published_but_notification_is_rate_limited() {
+        let now = RETRY_NAG_MS + 100_000;
+        let mut alerts = BTreeMap::new();
+        alerts.insert(
+            "w1:p1".into(),
+            LoopAlert {
+                count: 5,
+                first_at_ms: 0,
+                last_at_ms: now,
+                last_notified_ms: Some(now - 1), // nag window still open by 1 tick
+            },
+        );
+        // Inside the window by one tick: re-notification is NOT due.
+        let (tips, notified, kept) = merge_loop_alerts(&alerts, now);
+        assert_eq!(
+            tips.len(),
+            1,
+            "tip stays published while the streak is fresh"
+        );
+        assert!(
+            notified.is_empty(),
+            "no re-notification inside the nag window"
+        );
+        assert_eq!(kept.get("w1:p1").unwrap().last_notified_ms, Some(now - 1));
+
+        // A fresh match keeps the streak alive; once the nag window elapses
+        // the nag fires again and the stamp advances.
+        let later = now + RETRY_NAG_MS;
+        alerts.get_mut("w1:p1").unwrap().last_at_ms = later - 1_000;
+        let (tips, notified, kept) = merge_loop_alerts(&alerts, later);
+        assert_eq!(tips.len(), 1);
+        assert_eq!(notified, vec!["w1:p1".to_string()]);
+        assert_eq!(kept.get("w1:p1").unwrap().last_notified_ms, Some(later));
     }
 
     #[test]
@@ -428,6 +601,7 @@ mod tests {
                 count: 4,
                 first_at_ms: 10,
                 last_at_ms: 20,
+                last_notified_ms: None,
             },
         );
         store_loop_alerts(&paths, &alerts).unwrap();

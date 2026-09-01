@@ -550,3 +550,184 @@ fn watch_flags_fresh_retry_loop_as_urgent_tip() {
         tip["message"]
     );
 }
+
+// ------------------------------------------------------- daemon retry polling
+
+/// Fake `herdr` that serves the fleet snapshot AND `pane read` output: w1:p1
+/// (a recognized agent) prints the retry pattern, w1:p2 (recognized) stays
+/// clean, w1:p3 has no recognized agent and must be ignored. Any other
+/// argument set exits 1 so the daemon must treat it as a wedged server.
+fn install_fake_herdr_with_pane_read(fx: &Fixture) -> String {
+    let bin_dir = fx.root.join("fake-bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let canned = r#"{"result":{"snapshot":{"agents":[
+        {"agent":"claude","agent_status":"working","pane_id":"w1:p1","revision":42,"workspace_id":"ws"},
+        {"agent":"codex","agent_status":"idle","pane_id":"w1:p2","revision":7,"workspace_id":"ws"},
+        {"agent_status":"idle","pane_id":"w1:p3","revision":3,"workspace_id":"ws"}
+    ]}}}"#;
+    let body = format!(
+        r#"#!/bin/sh
+if [ "$1" = "api" ] && [ "$2" = "snapshot" ]; then
+  cat <<'EOF'
+{canned}
+EOF
+  exit 0
+fi
+if [ "$1" = "pane" ] && [ "$2" = "read" ]; then
+  case "$3" in
+    w1:p1) printf 'retrying: attempt 4\nstill retrying\n' ;;
+    w1:p2) printf 'all good\n' ;;
+    *) exit 1 ;;
+  esac
+  exit 0
+fi
+exit 1
+"#,
+        canned = canned,
+    );
+    let script = bin_dir.join("herdr");
+    std::fs::write(&script, &body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    bin_dir.to_string_lossy().into_owned()
+}
+
+/// Watch daemon env pointing at the fake herdr binary.
+fn retry_watch_env(fake_bin: &str) -> Vec<(String, String)> {
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    vec![
+        ("PATH".into(), format!("{fake_bin}:{path_env}")),
+        (
+            "HERDR_BIN_PATH".into(),
+            std::path::Path::new(fake_bin)
+                .join("herdr")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ]
+}
+
+/// The daemon's retry poll (not the event hook) must drive the ledger to an
+/// urgent tip when configured patterns keep appearing in an agent pane.
+#[test]
+fn watch_daemon_polling_flags_retry_loop_from_pane_output() {
+    let fx = fixture("retry-poll");
+    let now = now_ms();
+    seed_db(
+        &fx.root,
+        &[("claude", "a1", "/w/alpha", now - 3_600_000, now - 60_000)],
+    );
+    std::fs::create_dir_all(&fx.state_dir).unwrap();
+    std::fs::write(
+        fx.state_dir.join("config.toml"),
+        r#"
+retry_patterns = ["retrying"]
+retry_scan_interval_ms = 1000
+retry_window_lines = 60
+"#,
+    )
+    .unwrap();
+
+    let fake_bin = install_fake_herdr_with_pane_read(&fx);
+    let env = retry_watch_env(&fake_bin);
+    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let mut child = spawn_watch(&fx, &env_refs);
+    let alerts_path = fx.state_dir.join("loop-alerts.json");
+    let tips_path = fx.state_dir.join("tips.json");
+    let flagged = poll_until(Duration::from_secs(30), || {
+        let Ok(text) = std::fs::read_to_string(&tips_path) else {
+            return false;
+        };
+        let Ok(tips) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return false;
+        };
+        tips["items"].as_array().is_some_and(|items| {
+            items.iter().any(|t| {
+                t["pane_id"] == "w1:p1"
+                    && t["urgent"] == true
+                    && t["message"]
+                        .as_str()
+                        .is_some_and(|m| m.to_lowercase().contains("retry loop"))
+            })
+        })
+    });
+    let still_alive = child.0.try_wait().unwrap().is_none();
+    drop(child); // always killed, success or failure
+
+    assert!(flagged, "urgent retry tip from daemon polling within 30s");
+    assert!(still_alive, "daemon kept running");
+
+    // The ledger proves the poll path (not a seeded file) built the streak:
+    // w1:p1 counted, w1:p2 (clean output) and w1:p3 (no recognized agent)
+    // never did.
+    let alerts = read_json(&alerts_path);
+    assert!(
+        alerts["w1:p1"]["count"].is_u64() && alerts["w1:p1"]["count"].as_u64().unwrap() >= 3,
+        "w1:p1 streak reached the tip threshold: {alerts}"
+    );
+    assert!(alerts.get("w1:p2").is_none(), "clean pane must not streak");
+    assert!(
+        alerts.get("w1:p3").is_none(),
+        "pane without a recognized agent must be skipped"
+    );
+}
+
+/// With retry_patterns empty (the default), the daemon never polls pane
+/// output and no retry tip can fire, even though the pane prints the word.
+#[test]
+fn watch_daemon_skips_retry_polling_without_configured_patterns() {
+    let fx = fixture("retry-off");
+    let now = now_ms();
+    seed_db(
+        &fx.root,
+        &[("claude", "a1", "/w/alpha", now - 3_600_000, now - 60_000)],
+    );
+    // No config.toml: defaults apply (retry_patterns empty).
+
+    let fake_bin = install_fake_herdr_with_pane_read(&fx);
+    let env = retry_watch_env(&fake_bin);
+    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let mut child = spawn_watch(&fx, &env_refs);
+    // Give the daemon two scan cycles + a couple of poll windows; the fake
+    // herdr's exit-1 on unexpected args is fine — the daemon must survive it.
+    poll_until(Duration::from_secs(6), || {
+        std::fs::read_to_string(fx.state_dir.join("snapshot.json")).is_ok()
+    });
+    let still_alive = child.0.try_wait().unwrap().is_none();
+    drop(child);
+
+    assert!(
+        still_alive,
+        "daemon survived fake herdr rejecting extra args"
+    );
+    assert!(
+        !fx.state_dir.join("loop-alerts.json").exists(),
+        "no retry ledger written when patterns are unconfigured"
+    );
+    let tips = fx.state_dir.join("tips.json");
+    let no_retry_tip = std::fs::read_to_string(&tips)
+        .ok()
+        .map(|text| {
+            !serde_json::from_str::<serde_json::Value>(&text)
+                .map(|v| {
+                    v["items"]
+                        .as_array()
+                        .map(|items| {
+                            items.iter().any(|t| {
+                                t["message"]
+                                    .as_str()
+                                    .is_some_and(|m| m.to_lowercase().contains("retry"))
+                            })
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        })
+        .unwrap_or(true);
+    assert!(no_retry_tip, "no retry tip without configured patterns");
+}

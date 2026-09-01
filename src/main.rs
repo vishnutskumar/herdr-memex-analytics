@@ -157,6 +157,7 @@ fn run() -> Result<()> {
                 filters(None, None),
                 &paths,
                 Duration::from_secs(interval),
+                &cfg,
             )?;
         }
     }
