@@ -22,8 +22,11 @@ const ROWS: u16 = 30;
 /// Generous first-paint deadline: the binary may do a full scan on startup.
 const PAINT_TIMEOUT: Duration = Duration::from_secs(20);
 const KEY_TIMEOUT: Duration = Duration::from_secs(10);
-/// Quiet window before we treat the screen as settled (clamp tests).
 const QUIESCE_IDLE: Duration = Duration::from_millis(250);
+/// Overall budget for settle_until probes; a loaded runner needs multiple
+/// bounce-and-read cycles before a repaint of an already-processed event is
+/// observable, so this is deliberately several KEY_TIMEOUTs.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -502,6 +505,36 @@ fn feed_until(tui: &mut Tui, keys: &[u8], expected: &str) {
     }
 }
 
+/// Wait until the screen shows `expected`, or fail at the deadline. For
+/// exact-state assertions after a fixed event count where re-feeding is not
+/// safe (an up-scroll would overshoot past the bound): the events are
+/// queued in the TUI's event stream and processed one per loop iteration —
+/// they are never lost, so the only risk is reading before the repaint
+/// catches up on a loaded runner (where one iteration — full dashboard
+/// repaint plus 250 ms poll — can stretch past a single quiesce window).
+/// Each cycle gives the TUI a quiet stretch to drain its input queue
+/// (no SIGWINCH, so no Resize events compete with the real ones for the
+/// one-event-per-iteration queue), then bounces once: ratatui otherwise
+/// sends cell diffs, and a title digit change is a single-cell update that
+/// does not contain the full `Sessions <n>/<m>` string.
+fn settle_until(tui: &mut Tui, mark: usize, expected: &str, deadline: Duration) -> String {
+    let until = Instant::now() + deadline;
+    loop {
+        // Quiet stretch first: let the TUI process its queued events and
+        // redraw without us enqueueing Resize events.
+        tui.quiesce(QUIESCE_IDLE, Duration::from_secs(2));
+        let screen = tui.screen_after_input(mark, Duration::from_secs(1));
+        if screen.contains(expected) {
+            return screen;
+        }
+        assert!(
+            Instant::now() < until,
+            "screen never showed {expected:?}: {screen}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 #[test]
 fn j_k_keys_move_selection_with_title_updates() {
     let fx = fixture("jk-move");
@@ -552,15 +585,17 @@ fn selection_clamps_at_top_and_bottom_bounds() {
     );
 
     // Drive the selection to the bottom bound first, the way the other
-    // movement tests do: a fixed keystroke batch can be swallowed by the
-    // poll loop, leaving the clamp assertion a timing race.
+    // movement tests do: a single fixed keystroke batch is not always
+    // observable on a loaded runner (the repaint of the processed keys can
+    // lag behind the read), and re-feeding j is safe because the selection
+    // clamps at the bound.
     feed_until(&mut tui, b"j", "Sessions 3/3");
     // Hammer j well past the bottom bound; selection must stop at 3/3.
     let m = tui.mark();
     for _ in 0..10 {
         tui.feed(b"j");
     }
-    let screen = tui.screen_after_input(m, KEY_TIMEOUT);
+    let screen = settle_until(&mut tui, m, "Sessions 3/3", SETTLE_DEADLINE);
     assert_eq!(
         titles_in(&screen).into_iter().next_back(),
         Some((3, 3)),
@@ -576,28 +611,48 @@ fn mouse_wheel_scroll_moves_selection_and_clamps() {
 
     assert!(tui.wait_text("Sessions 1/3", PAINT_TIMEOUT));
 
-    // Two wheel-down events land on 3/3.
+    // The TUI event loop drains ONE input event per iteration (each one
+    // followed by a full repaint), so a queued burst of N events takes N
+    // repaint cycles to reach the screen — under load that can outlast any
+    // fixed deadline. Feed one event at a time and wait for its repaint
+    // before the next; the in-flight backlog stays at one.
+
+    // Wheel-down moves the selection forward, one step per event: 1/3 ->
+    // 2/3 -> 3/3.
     let m = tui.mark();
     tui.feed(&wheel_down(10, 5));
-    tui.feed(&wheel_down(10, 5));
-    let screen = tui.screen_after_input(m, KEY_TIMEOUT);
+    let screen = settle_until(&mut tui, m, "Sessions 2/3", SETTLE_DEADLINE);
     assert!(
-        screen.contains("Sessions 3/3"),
+        screen.contains("Sessions 2/3"),
         "wheel down should scroll the selection forward; screen: {screen}"
     );
+    let m = tui.mark();
+    tui.feed(&wheel_down(10, 5));
+    settle_until(&mut tui, m, "Sessions 3/3", SETTLE_DEADLINE);
 
-    // One wheel-up steps back to 2/3.
+    // One wheel-up steps back to 2/3. Re-feeding would overshoot past the
+    // bound, so settle_until (re-read only) is the right tool: the event is
+    // queued and will be processed; a too-early read is the only failure
+    // mode on a loaded runner.
     let m = tui.mark();
     tui.feed(&wheel_up(10, 5));
-    let screen = tui.screen_after_input(m, KEY_TIMEOUT);
+    let screen = settle_until(&mut tui, m, "Sessions 2/3", SETTLE_DEADLINE);
     assert!(
         screen.contains("Sessions 2/3"),
         "wheel up should scroll the selection back; screen: {screen}"
     );
 
-    // Hammering wheel-up past the top clamps at 1/3.
+    // Wheel-up past the top clamps at 1/3: the first up from 2/3 lands on
+    // 1/3, and every further up is a no-op (saturating_sub), so the state
+    // must stay 1/3 no matter how many more are queued or processed.
     let m = tui.mark();
-    for _ in 0..10 {
+    tui.feed(&wheel_up(10, 5));
+    settle_until(&mut tui, m, "Sessions 1/3", SETTLE_DEADLINE);
+    // Queue nine more ups at once. Each is a no-op, so none of them can
+    // change the state — after they are all drained, the title must still
+    // read 1/3. (No settle_until here: there is no new state to wait for.)
+    let m = tui.mark();
+    for _ in 0..9 {
         tui.feed(&wheel_up(10, 5));
     }
     let screen = tui.screen_after_input(m, KEY_TIMEOUT);
@@ -647,16 +702,11 @@ fn r_rescan_picks_up_new_sessions() {
     assert!(tui.wait_text("Sessions 1/3", PAINT_TIMEOUT));
 
     // A session lands in a brand-new project between scans; only a real
-    // rescan can make the title reflect it.
+    // rescan can make the title reflect it. Re-feeding `r` is safe: a
+    // rescan is idempotent.
     let now = now_ms();
     seed_db(&fx.root, &[("/w/delta", None, now - 600_000, now - 10_000)]);
-    let m = tui.mark();
-    tui.feed(b"r");
-    let screen = tui.screen_after_input(m, KEY_TIMEOUT);
-    assert!(
-        screen.contains("Sessions 1/4"),
-        "r must trigger a rescan that picks up the new project; screen: {screen}"
-    );
+    feed_until(&mut tui, b"r", "Sessions 1/4");
 }
 
 #[test]
